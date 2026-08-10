@@ -1,0 +1,4 @@
+CREATE TABLE lockers (
+  id SERIAL PRIMARY KEY,
+  label TEXT NOT NULL UNIQUE
+);
