@@ -3,7 +3,14 @@ import { env } from "./env.ts";
 
 const { Pool } = pg;
 
-export const pool = new Pool(env.pg);
+/**
+ * Explicit rather than relying on the `pg` default: the concurrency tests fire
+ * bursts of simultaneous checkouts, and a burst larger than this queues on the
+ * pool instead of actually contending in Postgres.
+ */
+export const POOL_SIZE = 10;
+
+export const pool = new Pool({ ...env.pg, max: POOL_SIZE });
 
 export async function withTransaction<T>(
   fn: (client: pg.PoolClient) => Promise<T>,
