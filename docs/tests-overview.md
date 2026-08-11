@@ -79,22 +79,56 @@ fencing token
 storage rejects stale A
 ```
 
-## Notes
-
-This project is a compact exploration of `how do concurrent Node processes safely modify shared state?`
-
-It moves through increasingly important boundaries:
+## Proposed file layout
 
 ```text
-JS async execution
-      ↓
-single Node process
-      ↓
-multiple Node processes
-      ↓
-Postgres transactions
-      ↓
-external coordination (Redis)
-      ↓
-storage-level correctness
+test/
+  integration/
+    baseline-race.test.ts
+
+    strategies/
+      advisory-lock/
+        contract.test.ts
+        lock-contention.test.ts
+        topology.test.ts
+
+      keyed-mutex/
+        contract.test.ts
+        queueing.test.ts
+        topology.test.ts
+
+      redis-fencing/
+        contract.test.ts
+        lock-ownership.test.ts
+        lease-expiry.test.ts
+        fencing.test.ts
+        topology.test.ts
+
+      optimistic-locking/
+        contract.test.ts
+        version-conflict.test.ts
+        topology.test.ts
+
+      unique-constraint/
+        contract.test.ts
+        constraint-collision.test.ts
+        topology.test.ts
+
+  support/
+    checkout-contract.ts
+    database.ts
+    checkout-worker.ts
 ```
+
+The baseline remains separate because it deliberately bypasses every strategy.
+Within each strategy directory:
+
+- `contract.test.ts` applies the shared black-box checkout contract.
+- The mechanism-specific file proves why that strategy works, such as lock
+  contention, a version conflict, or a constraint violation.
+- `topology.test.ts` exercises the strategy through explicit application
+  processes rather than relying on Vitest's worker processes.
+
+Redis has additional files because acquiring and safely releasing a lease,
+demonstrating expiry failure, and rejecting stale writers through fencing are
+separate claims.

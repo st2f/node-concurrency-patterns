@@ -1,7 +1,20 @@
 # node-concurrency-patterns
 
-Practicing strategies for closing a classic concurrency race — see
-[docs/PLAN.md](docs/PLAN.md) for the full writeup.
+A learning project exploring different ways to protect shared state when concurrent Node.js operations race to modify the same resource.
+
+The project uses a simple locker checkout invariant: **a locker can have at most one active checkout**. Concurrent requests deliberately race against that invariant, then several strategies are implemented and tested to understand where each one provides its guarantee.
+
+The strategies include:
+
+- in-process keyed mutexes
+- PostgreSQL advisory locks
+- Redis-based distributed locks
+- optimistic concurrency control
+- PostgreSQL constraints
+
+The goal is not just to make the race disappear, but to understand **why each strategy works, what its coordination boundary is, and what changes when the application runs across multiple Node.js processes**.
+
+See also [docs/PLAN.md](docs/PLAN.md) for the full progression and [docs/tests-overview.md](docs/tests-overview.md).
 
 ## Setup
 
@@ -20,7 +33,8 @@ npm test
   volume**, dropping its schema and data. Re-run `docker:up` + `migrate`
   afterward to get back to a clean database.
 
-Requires Node >=24.7 (see `.nvmrc`) — TypeScript files run directly via
-Node's built-in type stripping, with `erasableSyntaxOnly` ensuring the
-type checker rejects TypeScript syntax that Node cannot strip. There is no
+Requires Node >=24.7 (see `.nvmrc`). Runtime commands such as `migrate` execute
+TypeScript directly through Node's built-in type stripping; Vitest transforms
+test files and their imports. The `erasableSyntaxOnly` compiler option keeps
+the application source compatible with Node's native execution. There is no
 build step.

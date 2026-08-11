@@ -12,7 +12,8 @@
     "docker:reset": "docker compose down -v",
     "migrate": "node src/migrate.ts",
     "typecheck": "tsc --noEmit",
-    "test": "node --test test/**/*.test.ts"
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
     "ioredis": "^5.4.1",
@@ -21,6 +22,7 @@
   "devDependencies": {
     "@types/node": "^24.0.0",
     "@types/pg": "^8.11.10",
-    "typescript": "^5.7.2"
+    "typescript": "^5.7.2",
+    "vitest": "^4.1.5"
   }
 }
