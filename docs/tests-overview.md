@@ -87,21 +87,14 @@ test/
     baseline-race.test.ts
 
     strategies/
-      advisory-lock/
-        contract.test.ts
-        lock-contention.test.ts
-        topology.test.ts
-
       keyed-mutex/
         contract.test.ts
         queueing.test.ts
         topology.test.ts
 
-      redis-fencing/
+      advisory-lock/
         contract.test.ts
-        lock-ownership.test.ts
-        lease-expiry.test.ts
-        fencing.test.ts
+        lock-contention.test.ts
         topology.test.ts
 
       optimistic-locking/
@@ -112,6 +105,13 @@ test/
       unique-constraint/
         contract.test.ts
         constraint-collision.test.ts
+        topology.test.ts
+
+      redis-fencing/
+        contract.test.ts
+        lock-ownership.test.ts
+        lease-expiry.test.ts
+        fencing.test.ts
         topology.test.ts
 
   support/
@@ -128,6 +128,10 @@ Within each strategy directory:
   contention, a version conflict, or a constraint violation.
 - `topology.test.ts` exercises the strategy through explicit application
   processes rather than relying on Vitest's worker processes.
+
+The worker and parent-side IPC barrier are shared infrastructure: build them
+for the keyed-mutex topology test, then reuse them for the remaining strategy
+directories.
 
 Redis has additional files because acquiring and safely releasing a lease,
 demonstrating expiry failure, and rejecting stale writers through fencing are

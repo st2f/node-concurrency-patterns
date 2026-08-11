@@ -79,6 +79,11 @@ One module per strategy, each implementing the same `checkout()` shape and
 run against the applicable shared, deterministic, and process-topology
 tests from Step 1:
 
+The numbers below identify the strategy catalog; they are not the recommended
+implementation sequence. Work in complete vertical slices using the order in
+[`learning-steps.md`](learning-steps.md), so each strategy gains its behavioral,
+mechanism, and topology evidence before moving to the next one.
+
 1. **Postgres advisory lock** — `pg_advisory_xact_lock(hashtext(lockerKey))`
    inside the transaction wrapping find + checkout + save. Explicit,
    code-level (not implicit like `SELECT ... FOR UPDATE`), scoped to the
@@ -133,7 +138,9 @@ Short doc/table: mechanism, where it lives (DB vs. app vs. cache),
 correctness across multiple processes (yes/no), failure modes (lock
 expiry mid-operation, deadlocks, retry cost under contention), and when
 each is the right default for a serverless/container + Postgres + Redis
-stack.
+stack. Create the table with the first completed strategy and append its row
+after every vertical slice while the observed behavior and tradeoffs are still
+fresh; this step finishes and reviews the accumulated comparison.
 
 ## Test-harness decisions (make with Step 1b)
 

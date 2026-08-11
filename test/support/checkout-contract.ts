@@ -10,9 +10,14 @@ export interface CheckoutContractSubject {
   close?(): Promise<void>;
 }
 
+export interface CheckoutContractContext {
+  /** Prefix database-wide and external coordination keys with this value. */
+  namespace: string;
+}
+
 export interface CheckoutContractOptions {
   name: string;
-  createSubject(pool: Pool):
+  createSubject(pool: Pool, context: CheckoutContractContext):
     | CheckoutContractSubject
     | Promise<CheckoutContractSubject>;
   prepareDatabase?(pool: Pool): Promise<void>;
@@ -32,14 +37,23 @@ interface WinningAttempt extends SettledAttempt {
 export function checkoutContract(options: CheckoutContractOptions): void {
   test(`${options.name}: concurrent checkout contract`, async () => {
     const attemptCount = options.attemptCount ?? 16;
-    assert.ok(attemptCount >= 2, "the contract requires concurrent contention");
+    assert.ok(
+      Number.isInteger(attemptCount) && attemptCount >= 2,
+      "attemptCount must be an integer of at least two",
+    );
 
-    const database = await createIsolatedTestDatabase();
+    // Allow every attempt to hold one PG connection while requesting another.
+    // Making this relationship explicit avoids accidental pool starvation.
+    const database = await createIsolatedTestDatabase({
+      maxConnections: attemptCount * 2,
+    });
     let subject: CheckoutContractSubject | undefined;
 
     try {
       await options.prepareDatabase?.(database.pool);
-      subject = await options.createSubject(database.pool);
+      subject = await options.createSubject(database.pool, {
+        namespace: database.namespace,
+      });
       const checkout = subject.checkout;
 
       const locker = await database.pool.query<{ id: number }>(
@@ -54,6 +68,9 @@ export function checkoutContract(options: CheckoutContractOptions): void {
         releaseStart = resolve;
       });
 
+      // This aligns invocation after all attempt wrappers exist, increasing the
+      // chance of overlap. It does not prove contention; the deterministic
+      // mechanism tests control the boundary that matters to each strategy.
       const attempts = Array.from({ length: attemptCount }, (_, index) => {
         const userId = `user-${index + 1}`;
         return (async (): Promise<SettledAttempt> => {
