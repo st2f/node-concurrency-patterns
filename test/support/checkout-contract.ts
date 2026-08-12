@@ -33,6 +33,22 @@ interface WinningAttempt extends SettledAttempt {
   result: Extract<CheckoutResult, { outcome: "checked_out" }>;
 }
 
+/**
+ * Fill the pool with idle connections before any attempt runs.
+ *
+ * A cold pool hides races. Every `pool.connect()` would pay a TCP and auth
+ * round trip, and those resolve far enough apart that each attempt finishes its
+ * whole transaction before the next one connects. An entirely unprotected
+ * checkout then serializes by accident and satisfies this contract. Warming the
+ * pool lets `connect()` resolve from the idle list, so the attempts overlap.
+ */
+async function warmConnections(pool: Pool, count: number): Promise<void> {
+  const clients = await Promise.all(
+    Array.from({ length: count }, () => pool.connect()),
+  );
+  for (const client of clients) client.release();
+}
+
 /** Register the shared Step 1b black-box contract for a checkout strategy. */
 export function checkoutContract(options: CheckoutContractOptions): void {
   test(`${options.name}: concurrent checkout contract`, async () => {
@@ -44,8 +60,9 @@ export function checkoutContract(options: CheckoutContractOptions): void {
 
     // Allow every attempt to hold one PG connection while requesting another.
     // Making this relationship explicit avoids accidental pool starvation.
+    const connectionCount = attemptCount * 2;
     const database = await createIsolatedTestDatabase({
-      maxConnections: attemptCount * 2,
+      maxConnections: connectionCount,
     });
     let subject: CheckoutContractSubject | undefined;
 
@@ -63,14 +80,18 @@ export function checkoutContract(options: CheckoutContractOptions): void {
       const lockerId = locker.rows[0]?.id;
       assert.ok(lockerId !== undefined);
 
+      await warmConnections(database.pool, connectionCount);
+
       let releaseStart: (() => void) | undefined;
       const start = new Promise<void>((resolve) => {
         releaseStart = resolve;
       });
 
-      // This aligns invocation after all attempt wrappers exist, increasing the
-      // chance of overlap. It does not prove contention; the deterministic
-      // mechanism tests control the boundary that matters to each strategy.
+      // The barrier plus the warm pool make real overlap likely: every attempt
+      // is released once the others exist, and none of them stalls on a new
+      // connection. Overlap is still probabilistic, so this contract cannot
+      // prove contention on its own; the deterministic mechanism tests control
+      // the boundary that matters to each strategy.
       const attempts = Array.from({ length: attemptCount }, (_, index) => {
         const userId = `user-${index + 1}`;
         return (async (): Promise<SettledAttempt> => {
