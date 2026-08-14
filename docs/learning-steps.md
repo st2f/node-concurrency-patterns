@@ -142,8 +142,6 @@ topology.test.ts: mutexes do not coordinate across processes
 
 Then repeat for the next strategy.
 
-Do not add all five `contract.test.ts` files first. They would merely create several failing tests for implementations that do not exist yet, without giving a complete lesson about any mechanism.
-
 The original 1b/1c/1d labels are better understood as test categories, not implementation phases:
 
 ```text

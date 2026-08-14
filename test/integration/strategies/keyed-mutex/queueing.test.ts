@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import type { Pool } from "pg";
-import { test } from "vitest";
+import { it } from "vitest";
 import type { CheckoutResult } from "../../../../src/checkout.ts";
 import { createKeyedMutexCheckout } from "../../../../src/strategies/keyed-mutex.ts";
 import { createIsolatedTestDatabase } from "../../../support/database.ts";
@@ -62,7 +62,7 @@ function drainEventLoop(): Promise<void> {
   });
 }
 
-test("keyed mutex queues callers for the same locker", async () => {
+it("queues keyed-mutex callers for the same locker", async () => {
   const database = await createIsolatedTestDatabase({ maxConnections: 2 });
   const firstAtAvailabilityRead = createBarrier();
   const releaseFirstCaller = createBarrier();
@@ -147,7 +147,7 @@ test("keyed mutex queues callers for the same locker", async () => {
   }
 });
 
-test("keyed mutex does not block concurrency on two different lockers", async () => {
+it("does not block concurrent keyed-mutex checkouts for different lockers", async () => {
   // One connection per caller: both must be in flight at the same time, and
   // neither may wait on the pool for the other to finish.
   const database = await createIsolatedTestDatabase({ maxConnections: 2 });

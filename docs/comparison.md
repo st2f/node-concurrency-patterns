@@ -1,44 +1,76 @@
 # Strategy comparison
 
-One row per strategy, drafted during its slice and considered complete once its
-behavioral, mechanism, and topology tests are in place. "Correct across
-processes" is the question that matters for a container or serverless deployment,
-where the same image runs many times.
+This page grows one strategy at a time. A strategy is added after its shared
+contract, mechanism, and process-topology tests are complete.
 
-| Strategy | Mechanism | Coordination lives in | Correct across processes | Main failure mode |
+## At a glance
+
+| Strategy | Coordination lives in | Works in one process | Works across processes | Best fit |
 | --- | --- | --- | --- | --- |
-| Keyed mutex | Per-locker promise chain: each caller awaits the tail promise for its locker id before reading availability, and releases its tail after the database operation completes | A `Map` owned by one factory instance, normally reused as a process-level singleton | No | Two processes hold two independent mutexes, so both can pass the availability read and both insert |
+| Keyed mutex | A JavaScript `Map` owned by one checkout instance | Yes, with one shared instance | No | A single writer process, or a local optimization above a shared guard |
+
+"Works across processes" is especially important for containers and
+serverless functions. Each running instance has its own JavaScript memory.
 
 ## Keyed mutex
 
-After the preceding tail settles, the caller owns the critical section before it
-acquires a connection. Its tail is released by the outer `finally` after the
-database work and client cleanup, whether the operation commits, rolls back, or
-fails earlier. Therefore, the availability read and insert cannot be interleaved
-by another caller using the same checkout instance. Nothing about the mechanism
-reaches storage: the queue is plain JavaScript state, which is why its
-synchronization boundary is exactly the factory instance that owns the `Map`.
+### How it works
 
-Failure modes:
+`createKeyedMutexCheckout()` creates a `Map` of promise queues, keyed by locker
+ID. Calls for the same locker wait in the same queue:
 
-- **Multiple instances.** Each instance gets its own queue, and the invariant is
-  no longer enforced between them. Normally this means one queue per process,
-  and that is the defining limitation, not a bug.
-- **Serialization cost.** All callers for one locker are queued, including the
-  ones that will lose. Under heavy contention on a single locker, latency grows
-  with queue depth even though only the first caller can win.
-- **Long critical section.** The mutex is acquired before `pool.connect()`, so a
-  caller holds it while waiting for a connection as well as across its database
-  round trips. The queue convoys behind whichever caller is slowest, and pool
-  exhaustion elsewhere in the process shows up as checkout latency here.
+```text
+caller A: read → insert → release
+                              ↓
+caller B:                  read → return unavailable
+```
 
-Appropriate when the process is genuinely the only writer and every write uses
-the same checkout instance: a single-instance worker, a CLI, or a test. In a
-container or serverless stack it is not sufficient on its own. It remains useful
-*above* a shared mechanism, where a process-level singleton collapses local
-contention before that contention reaches Postgres or Redis — but the correctness
-guarantee has to come from the shared layer.
+Calls for different lockers use different queues, so they can run at the same
+time.
 
-The queueing and topology tests that demonstrate both halves of this claim are
-still pending; the row above records the mechanism's boundary, and
-`topology.test.ts` is what will make the "No" concrete.
+The `Map` belongs to one factory-created checkout instance. The application
+must therefore create that instance once and reuse it. Creating another
+instance creates another independent `Map`.
+
+### What the tests prove
+
+| Test | Evidence |
+| --- | --- |
+| [Shared contract](../test/integration/strategies/keyed-mutex/contract.test.ts) | Many concurrent calls through one checkout instance produce one winner, while every other caller returns `unavailable`. Postgres contains one active checkout. |
+| [Same-locker queueing](../test/integration/strategies/keyed-mutex/queueing.test.ts) | While caller A is held inside the critical section, caller B cannot reach the same point or request a database connection. |
+| [Different-locker concurrency](../test/integration/strategies/keyed-mutex/queueing.test.ts) | Caller B can enter its critical section while caller A is paused when they use different locker IDs. Both calls succeed. |
+| [Two-process topology](../test/integration/strategies/keyed-mutex/topology.test.ts) | Two explicit Node.js child processes both reach the availability-read seam before either is released. Both then succeed, leaving two active checkouts. |
+
+Together, the tests show the boundary clearly:
+
+```text
+same checkout instance → shared Map     → callers are coordinated
+different processes    → separate Maps → callers are not coordinated
+```
+
+The two-process test passes by demonstrating this expected limitation. The
+mutex is behaving correctly; it simply cannot coordinate memory owned by
+another process.
+
+### Tradeoffs
+
+- **Process-local only.** Multiple factory instances, application processes,
+  containers, or serverless invocations do not share the queue.
+- **Hot lockers build a queue.** Calls for one popular locker wait one at a
+  time, so latency grows with the number of callers.
+- **The current critical section includes pool waiting.** A caller acquires the
+  mutex before `pool.connect()`. A busy database pool can therefore delay every
+  caller queued for that locker.
+- **All writers must use the same instance.** Code that writes directly to
+  Postgres bypasses the mutex completely.
+
+### When to use it
+
+A keyed mutex is sufficient when one process is genuinely the only writer and
+all writes use the same checkout instance—for example, a CLI or a
+single-instance worker.
+
+It is not sufficient by itself in a multi-container or serverless deployment.
+It can still be useful there as a local optimization: it can reduce contention
+before requests reach Postgres or Redis, while the shared system provides the
+actual correctness guarantee.

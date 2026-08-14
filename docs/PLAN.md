@@ -1,174 +1,218 @@
 # Concurrency Patterns — Practice Plan
 
-## Why
+## Purpose
 
-Practicing the alternatives for closing a classic concurrency race: an
-invariant like "two callers can't claim the same resource at the same time"
-gets violated when a naive `find` → `mutate` → `save` sequence lets two
-concurrent callers interleave and both succeed. This repo works through the
-options for closing that race — DB-level locking, app-level locking,
-distributed locking, optimistic concurrency, and a DB constraint as a
-safety net — each proven against a real concurrent-connections test, not an
-in-memory fake.
+This project practices several ways to protect a shared rule when concurrent
+Node.js operations modify the same data.
 
-Secondary goal: hands-on practice with raw Postgres (no ORM, no query
-builder) and raw Redis (no framework facade around it) — both common
-building blocks for this kind of coordination problem in serverless /
-container-based backends.
+The rule in this project is:
 
-## Domain under test
+> A locker can have at most one active checkout.
 
-A minimal `Locker` domain: a `checkout(user, locker)` operation on an
-aggregate, backed by Postgres, with the invariant "no two users can hold
-the same locker at the same time."
+A naive checkout does this:
 
-## Setup
+1. Read whether the locker is available.
+2. If it is available, insert a checkout.
 
-- Raw `pg` (node-postgres) client — no ORM, no query builder.
-- `docker-compose.yml` with real Postgres **and** Redis (both common in
-  serverless/container backends).
-- Plain SQL migration files (or `node-pg-migrate`).
-- `pg.Pool`, explicit `BEGIN`/`COMMIT`, parameterized queries.
+The race occurs when callers A and B both complete the read before either one
+inserts. Both see an available locker, so both insert a checkout.
 
-## Step 1 — Prove the race
+The project compares ways to prevent or detect that race in Node.js, Postgres,
+and Redis. Every strategy is tested with real infrastructure rather than an
+in-memory database fake.
 
-Must run against real Postgres in a container, with genuinely concurrent
-connections/processes — not an in-memory fake.
+A secondary goal is to practice the low-level APIs involved: `pg.Pool`, SQL
+transactions, parameterized queries, and raw Redis commands without an ORM or
+framework abstraction.
 
-1a. **Deterministic interleaving (baseline demonstration only).** Drive two
-raw `pg` client connections directly from the test, step by step: issue
-`find` on connection A, await it; issue `find` on connection B, await
-it; _then_ issue `mutate`+`save` on A, await; then on B, await. Both
-reads observe "available" before either write happens, so the bug
-reproduces on every run — no timing luck involved, no synchronization
-hook needed inside application code. This talks to Postgres directly
-and bypasses whatever `checkout()` API a strategy wraps around it, so
-it can only ever demonstrate the _unprotected_ baseline — a correctly
-serialized strategy has nothing to "pass" here, since its guard code
-never runs in this test. Scope it to Step 1 only; it is not reused in
-Step 2.
+## Domain and infrastructure
 
-1b. **Shared concurrent-load contract.** Fire N concurrent "checkout the
-same locker" calls **through each strategy's real `checkout()`
-function** and inspect both the returned results and the final database
-state. In the single-process suite, every protected strategy must yield
-exactly one winner and one active checkout. This exercises the real
-guard code, but natural scheduling can accidentally serialize a broken
-implementation, so it is a useful shared contract/load test rather
-than sufficient proof by itself.
+- `checkout(userId, lockerId)` is the operation under test.
+- Postgres stores lockers and their checkout history.
+- Redis is used by the distributed-lock strategy.
+- Docker Compose starts Postgres and Redis.
+- SQL migrations create and evolve the Postgres schema.
 
-1c. **Deterministic, strategy-specific tests.** Add controlled contention
-at the boundary relevant to each mechanism rather than forcing every
-implementation through the same interleaving. Examples: hold an
-advisory lock on one connection while another waits; keep the first
-mutex callback open while a second queues; coordinate Redis holders by
-worker-process messages; and make two optimistic writers attempt the
-same expected version. These tests prove that the intended mechanism —
-not merely a favorable scheduler — produced the result.
+## Step 1 — Establish the tests
 
-1d. **Process-topology tests.** Run the same checkout attempt from two Node
-processes. The expected result is part of the lesson: the app-level
-mutex must pass within one process but is expected to fail across two,
-while the Postgres, Redis-with-storage-validation, optimistic-locking,
-and unique-constraint strategies must preserve the invariant across
-processes.
+### Baseline race
 
-## Step 2 — Implement and compare strategies
+Use two Postgres connections and control the order explicitly:
 
-One module per strategy, each implementing the same `checkout()` shape and
-run against the applicable shared, deterministic, and process-topology
-tests from Step 1:
+```text
+A reads "available"
+B reads "available"
+A inserts
+B inserts
+```
 
-The numbers below identify the strategy catalog; they are not the recommended
-implementation sequence. Work in complete vertical slices using the order in
-[`learning-steps.md`](learning-steps.md), so each strategy gains its behavioral,
-mechanism, and topology evidence before moving to the next one.
+This test reliably demonstrates the original bug. It talks directly to
+Postgres and deliberately bypasses `checkout()`, so it is not reused to test a
+strategy.
 
-1. **Postgres advisory lock** — `pg_advisory_xact_lock(hashtext(lockerKey))`
-   inside the transaction wrapping find + checkout + save. Explicit,
-   code-level (not implicit like `SELECT ... FOR UPDATE`), scoped to the
-   transaction so it auto-releases on commit/rollback.
+### Shared behavior contract
 
-2. **App-level keyed mutex/queue** — in-memory, per aggregate id (hand-rolled
-   promise queue). Demonstrates the limitation directly: only serializes
-   within a single process, so it does **not** protect against races across
-   multiple serverless invocations / container replicas.
+Call a strategy's real `checkout()` function many times concurrently for the
+same locker. A correct strategy should return exactly one successful checkout
+and leave exactly one active checkout in Postgres.
 
-3. **Redis distributed lock** — raw `ioredis` (not a framework facade):
-   `SET lock:<key> <token> NX PX <ttl>` to acquire, release only if the
-   stored value still matches the token (via a Lua script through `EVAL`,
-   to avoid releasing a lock that expired and was re-acquired by someone
-   else). Prove it works across **two separate Node processes** hitting the
-   same Redis + Postgres — something the in-memory mutex can't do.
+This is useful shared coverage, but it is not enough by itself. Node.js may
+happen to run the calls one after another, allowing a broken strategy to pass
+by chance.
 
-   Token-checked release only stops one owner deleting _another_ owner's
-   lock — it does **not** stop a stalled/GC-paused owner from resuming and
-   writing _after_ its lock already expired and a new owner acquired it
-   (the classic Redlock-safety objection: Kleppmann vs. antirez).
-   Demonstrate this failure directly: pause a holder past its TTL, let a
-   second holder acquire and proceed, then let the first resume its write.
+### Strategy-specific mechanism test
 
-   Then demonstrate storage-layer validation. Prefer a genuine fencing
-   token for this strategy: allocate a monotonically increasing token when
-   acquiring the lock, persist the last accepted token with the locker,
-   and have Postgres reject writes carrying an older token. Contrast this
-   with `UPDATE ... WHERE version = $expected`, which also protects the
-   invariant but is optimistic compare-and-swap — effectively strategy 4
-   combined with the Redis lock, not fencing itself. This distinction is
-   one of the most valuable lessons in the repo: a lock lease alone does
-   not guarantee mutual exclusion after expiry unless the storage layer
-   rejects stale writers.
+Control the point where callers contend so the test proves why a strategy
+works. For example:
 
-4. **Optimistic locking with a version column** — both processes read
-   freely, conflict is only detected at write time, loser retries.
+- Keep caller A inside a keyed mutex and prove caller B waits.
+- Hold a Postgres advisory lock and prove another connection waits.
+- Make two optimistic writers use the same version.
+- Coordinate Redis lock holders with child-process messages.
 
-5. **Unique constraint** — the DB-level safety net, independent of
-   application code correctness. A bare `UNIQUE (locker_id)` only works if
-   checkouts are never kept as history; with a `checkouts` table that
-   retains past rows, the real mechanism is a **partial unique index**,
-   e.g. `CREATE UNIQUE INDEX ... ON checkouts (locker_id) WHERE
-released_at IS NULL`. Worth calling out explicitly: this is the one
-   strategy where the fix isn't a locking _technique_ at all — it's
-   expressing the invariant directly as a constraint the database enforces
-   unconditionally.
+### Process-topology test
 
-## Step 3 — Write up the comparison
+Run two concurrent checkout attempts in two separate Node.js processes. This
+reveals where each coordination mechanism lives:
 
-Short doc/table: mechanism, where it lives (DB vs. app vs. cache),
-correctness across multiple processes (yes/no), failure modes (lock
-expiry mid-operation, deadlocks, retry cost under contention), and when
-each is the right default for a serverless/container + Postgres + Redis
-stack. Create the table with the first completed strategy and append its row
-after every vertical slice while the observed behavior and tradeoffs are still
-fresh; this step finishes and reviews the accumulated comparison.
+- A keyed mutex coordinates only callers in one process, so two processes can
+  both win.
+- Postgres, Redis with stale-write protection, optimistic locking, and a
+  database uniqueness rule must protect the invariant across processes.
 
-## Test-harness decisions (make with Step 1b)
+## Step 2 — Implement one strategy at a time
 
-These are deliberately deferred until the strategy interface and shared
-test suite exist, but must be resolved before relying on the comparison:
+For each strategy, complete its shared contract, mechanism test, and topology
+test before starting the next strategy. Then add what was learned to
+[`comparison.md`](comparison.md).
 
-- **Database isolation:** choose a clean schema/database per strategy or a
-  deterministic reset fixture. In particular, applying the partial unique
-  index for strategy 5 must not silently change the behavior attributed to
-  strategies 1–4. Because Docker volumes live outside Git, changing a
-  branch or module does not reset database state.
-- **Test-runner concurrency:** either serialize integration-test files or
-  give each test worker isolated database state. Cleanup performed inside
-  one transaction cannot cover the separate connections/processes used by
-  these tests.
-- **Client ownership:** make every process that creates a `pg.Pool` or
-  Redis connection responsible for closing it (`pool.end()` and
-  `redis.quit()`/`disconnect()`). Prefer fixtures or factories when the
-  shared suite makes the required lifetime clear.
-- **No false-green run:** once the first test is introduced, ensure the
-  integration command cannot report success merely because it discovered
-  zero tests.
+### App-level keyed mutex
 
-## Deferred / another time
+Maintain a promise queue for each locker ID. A caller waits for the previous
+promise before reading and writing, then releases its promise for the next
+caller.
 
-- **PGlite** for fast tests without Docker. Not used here because it's
-  single-process / single active backend (queues concurrent calls rather
-  than truly running them concurrently, no listener for a second OS process
-  to connect to by default) — which undermines the exact thing this repo
-  is trying to prove. Worth evaluating separately for TDD-speed unit tests
-  once this repo's concurrency work is done.
+The queue is ordinary JavaScript memory. It works when every caller uses the
+same checkout instance in one process. Two serverless invocations or container
+replicas have different queues, so the mutex cannot coordinate between them.
+
+### Postgres advisory lock
+
+Acquire `pg_advisory_xact_lock(...)` inside the transaction before checking the
+locker. Every process using the same lock key asks Postgres for the same lock,
+so Postgres serializes them.
+
+The transaction-scoped lock is automatically released on commit or rollback.
+All code paths that modify this state must follow the locking convention.
+
+### Optimistic locking with a version column
+
+Optimistic locking does not make the second caller wait before reading.
+Instead, it detects at write time that another caller has changed the data.
+
+Suppose callers A and B both read version `7`. Each tries a conditional update:
+
+```sql
+UPDATE lockers
+SET version = version + 1
+WHERE id = $1 AND version = $2;
+```
+
+Here, `$2` is the version the caller read: `7` in this example.
+
+Postgres performs each update atomically:
+
+- A updates the row, changing the version to `8`.
+- B's condition no longer matches, so B updates zero rows.
+
+The affected-row count (`result.rowCount` in `pg`) tells the application who
+won. The winner inserts the checkout in the same transaction. The loser reads
+the current state again and, for this domain, normally returns `unavailable`.
+
+This conditional update is often called **compare-and-swap**:
+
+- **Compare:** is the current version still the version I read?
+- **Swap:** if it is, apply my change and advance the version.
+
+### Database uniqueness rule
+
+Let Postgres enforce the invariant directly. Because the `checkouts` table
+keeps historical rows, `UNIQUE (locker_id)` would be too strict: it would
+prevent a locker from ever being checked out again.
+
+Use a partial unique index that applies only to active rows:
+
+```sql
+CREATE UNIQUE INDEX one_active_checkout_per_locker
+ON checkouts (locker_id)
+WHERE released_at IS NULL;
+```
+
+If two processes insert concurrently, Postgres accepts one insert and rejects
+the other. The application converts that expected conflict into an
+`unavailable` result. This strategy is not a locking technique; it expresses
+the business rule in the database.
+
+### Redis distributed lock and fencing
+
+First, implement a Redis lease:
+
+```text
+SET lock:<key> <owner-token> NX PX <ttl>
+```
+
+`NX` acquires the key only when it does not already exist. `PX` gives the lock
+a time-to-live so a crashed owner cannot hold it forever. Release the lock with
+an atomic Lua script that deletes the key only when its value still equals the
+caller's owner token.
+
+The owner-token check makes release safe, but it does not make an expired owner
+safe. Consider this sequence:
+
+```text
+A acquires the lock
+A pauses until its lease expires
+B acquires the lock and writes
+A resumes and tries to write
+```
+
+A must not be allowed to write after B. Checking the token during release only
+stops A from deleting B's lock; it does not stop A's database write.
+
+The owner token above is a random identity: it answers "is this still my
+lock?" A fencing token is different. It is an increasing number that records
+the order in which owners acquired the lock.
+
+Postgres remembers the highest fencing token it has accepted and rejects a
+write carrying an older token. A resumed owner can therefore be recognized as
+stale even after its Redis lease expires.
+
+Fencing and optimistic locking both use conditional database writes, but their
+values mean different things:
+
+- An optimistic-lock version is read from the database row. The write succeeds
+  only if that row still has the same version.
+- A fencing token represents the order in which owners acquired the lock. The
+  database rejects an owner older than one it has already accepted.
+
+Using `UPDATE ... WHERE version = $expected` alongside Redis can still be a
+valid design, but it combines the Redis lease with optimistic locking. It is
+not, by itself, a fencing-token implementation.
+
+## Test-harness decisions
+
+- **Database isolation:** Give each test a separate schema. In particular, the
+  partial unique index must not change the behavior of other strategies.
+- **Test-runner concurrency:** Run integration-test files serially or isolate
+  their database state. One cleanup transaction cannot include work performed
+  by other connections or processes.
+- **Client ownership:** The process that creates a `pg.Pool` or Redis connection
+  must close it with `pool.end()` or `redis.quit()`/`disconnect()`.
+- **Deterministic cleanup:** Release barriers and close clients in `finally`
+  blocks so a failed assertion does not leave a test or child process hanging.
+
+## Related documents
+
+- [Strategy comparison](comparison.md)
+- [Test overview](tests-overview.md)
+- [Incremental learning steps](learning-steps.md)

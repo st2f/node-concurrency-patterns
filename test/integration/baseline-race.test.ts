@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { test } from "vitest";
+import { it } from "vitest";
 import { createIsolatedTestDatabase } from "../support/database.ts";
 
-test("two unprotected checkouts can claim the same locker", async () => {
+it("allows two unprotected checkouts to claim the same locker", async () => {
   const database = await createIsolatedTestDatabase({ maxConnections: 2 });
   const { pool } = database;
 

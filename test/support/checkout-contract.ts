@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import type { Pool } from "pg";
-import { test } from "vitest";
+import { it } from "vitest";
 import type { Checkout, CheckoutResult } from "../../src/checkout.ts";
 import { createIsolatedTestDatabase } from "./database.ts";
 
@@ -11,15 +11,16 @@ export interface CheckoutContractSubject {
 }
 
 export interface CheckoutContractContext {
-  /** Prefix database-wide and external coordination keys with this value. */
+  // database prefix
   namespace: string;
 }
 
 export interface CheckoutContractOptions {
   name: string;
-  createSubject(pool: Pool, context: CheckoutContractContext):
-    | CheckoutContractSubject
-    | Promise<CheckoutContractSubject>;
+  createSubject(
+    pool: Pool,
+    context: CheckoutContractContext,
+  ): CheckoutContractSubject | Promise<CheckoutContractSubject>;
   prepareDatabase?(pool: Pool): Promise<void>;
   attemptCount?: number;
 }
@@ -33,15 +34,6 @@ interface WinningAttempt extends SettledAttempt {
   result: Extract<CheckoutResult, { outcome: "checked_out" }>;
 }
 
-/**
- * Fill the pool with idle connections before any attempt runs.
- *
- * A cold pool hides races. Every `pool.connect()` would pay a TCP and auth
- * round trip, and those resolve far enough apart that each attempt finishes its
- * whole transaction before the next one connects. An entirely unprotected
- * checkout then serializes by accident and satisfies this contract. Warming the
- * pool lets `connect()` resolve from the idle list, so the attempts overlap.
- */
 async function warmConnections(pool: Pool, count: number): Promise<void> {
   const clients = await Promise.all(
     Array.from({ length: count }, () => pool.connect()),
@@ -49,9 +41,8 @@ async function warmConnections(pool: Pool, count: number): Promise<void> {
   for (const client of clients) client.release();
 }
 
-/** Register the shared Step 1b black-box contract for a checkout strategy. */
 export function checkoutContract(options: CheckoutContractOptions): void {
-  test(`${options.name}: concurrent checkout contract`, async () => {
+  it(`enforces the concurrent checkout contract for ${options.name}`, async () => {
     const attemptCount = options.attemptCount ?? 16;
     assert.ok(
       Number.isInteger(attemptCount) && attemptCount >= 2,
