@@ -3,6 +3,7 @@ import type { Checkout } from "../checkout.ts";
 
 export interface AdvisoryLockCheckoutOptions {
   lockNamespace: string;
+  afterAdvisoryLockAcquired?(): Promise<void>;
 }
 
 export function createAdvisoryLockCheckout(
@@ -36,6 +37,8 @@ export function createAdvisoryLockCheckout(
         `,
         [options.lockNamespace, lockerId],
       );
+
+      await options.afterAdvisoryLockAcquired?.();
 
       const availability = await client.query<{ available: boolean }>(
         `

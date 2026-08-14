@@ -122,12 +122,13 @@ run concurrently because a collision makes them share a lock.
 | Test                                                                                    | Status and evidence                                                                                                                      |
 | --------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
 | [Shared contract](../test/integration/strategies/advisory-lock/contract.test.ts)        | Complete. Many concurrent calls produce one winner, every other caller returns `unavailable`, and Postgres contains one active checkout. |
-| [Lock contention](../test/integration/strategies/advisory-lock/lock-contention.test.ts) | Pending. This will hold one connection's advisory lock and prove that another connection requesting the same key waits.                  |
+| [Lock contention](../test/integration/strategies/advisory-lock/lock-contention.test.ts) | Complete. Caller A pauses while holding the lock; `pg_locks` shows caller B waiting for that exact key. B acquires it only after A is released. |
 | [Two-process topology](../test/integration/strategies/advisory-lock/topology.test.ts)   | Pending. This will prove that checkout instances in separate Node.js processes coordinate through PostgreSQL.                            |
 
-The completed contract establishes the behavior in one process. The pending
-tests will establish why it works and confirm that the coordination boundary
-is the database rather than Node.js memory.
+The contract establishes the behavior in one process, and the contention test
+proves that PostgreSQL serializes callers requesting the same key. The pending
+topology test will confirm that this coordination also crosses Node.js process
+boundaries.
 
 ### Tradeoffs
 
