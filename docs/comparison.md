@@ -9,7 +9,7 @@ still pending.
 | Strategy                                  | Coordination lives in                             | Works in one process          | Works across processes          | Best fit                                                              |
 | ----------------------------------------- | ------------------------------------------------- | ----------------------------- | ------------------------------- | --------------------------------------------------------------------- |
 | Keyed mutex                               | A JavaScript `Map` owned by one checkout instance | Yes, with one shared instance | No                              | A single writer process, or a local optimization above a shared guard |
-| Postgres advisory lock (`READ COMMITTED`) | PostgreSQL's advisory-lock manager                | Yes                           | Expected; topology test pending | Multiple application processes sharing one Postgres database          |
+| Postgres advisory lock (`READ COMMITTED`) | PostgreSQL's advisory-lock manager                | Yes                           | Yes                             | Multiple application processes sharing one Postgres database          |
 
 "Works across processes" is especially important for containers and
 serverless functions. Each running instance has its own JavaScript memory.
@@ -123,11 +123,11 @@ run concurrently because a collision makes them share a lock.
 | --------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
 | [Shared contract](../test/integration/strategies/advisory-lock/contract.test.ts)        | Complete. Many concurrent calls produce one winner, every other caller returns `unavailable`, and Postgres contains one active checkout. |
 | [Lock contention](../test/integration/strategies/advisory-lock/lock-contention.test.ts) | Complete. Caller A pauses while holding the lock; `pg_locks` shows caller B waiting for that exact key. B acquires it only after A is released. |
-| [Two-process topology](../test/integration/strategies/advisory-lock/topology.test.ts)   | Pending. This will prove that checkout instances in separate Node.js processes coordinate through PostgreSQL.                            |
+| [Two-process topology](../test/integration/strategies/advisory-lock/topology.test.ts)   | Complete. Two explicit Node.js child processes request the same lock key. PostgreSQL makes B wait for A, producing one active checkout.   |
 
-The contract establishes the behavior in one process, and the contention test
-proves that PostgreSQL serializes callers requesting the same key. The pending
-topology test will confirm that this coordination also crosses Node.js process
+The contract establishes the behavior in one process, the contention test
+proves that PostgreSQL serializes callers requesting the same key, and the
+topology test confirms that this coordination crosses Node.js process
 boundaries.
 
 ### Tradeoffs

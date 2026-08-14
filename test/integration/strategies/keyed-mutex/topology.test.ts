@@ -65,8 +65,8 @@ it("allows both checkout attempts to win across application processes", async ()
     attemptB = workerB.startCheckout("user-b", lockerId);
 
     const states = {
-      seamA: attemptA.atAvailabilityRead,
-      seamB: attemptB.atAvailabilityRead,
+      seamA: attemptA.atOrchestrationSeam,
+      seamB: attemptB.atOrchestrationSeam,
       resultA: attemptA.result,
       resultB: attemptB.result,
     };
@@ -79,13 +79,13 @@ it("allows both checkout attempts to win across application processes", async ()
     // seam. Therefore both are simultaneously inside critical sections owned
     // by different in-memory mutex instances.
     await Promise.all([
-      attemptA.atAvailabilityRead,
-      attemptB.atAvailabilityRead,
+      attemptA.atOrchestrationSeam,
+      attemptB.atOrchestrationSeam,
     ]);
     trace.mark("both processes parked at the seam", states);
 
-    attemptA.releaseAvailabilityRead();
-    attemptB.releaseAvailabilityRead();
+    attemptA.releaseOrchestrationSeam();
+    attemptB.releaseOrchestrationSeam();
     // Sending an IPC message settles nothing synchronously: both results are
     // still pending here, and stay pending until each child replies.
     trace.mark("release messages sent", states);
@@ -112,8 +112,8 @@ it("allows both checkout attempts to win across application processes", async ()
   } finally {
     // Release messages are buffered by the worker, so cleanup is safe even if
     // an assertion fails before an attempt reaches its seam.
-    attemptA?.releaseAvailabilityRead();
-    attemptB?.releaseAvailabilityRead();
+    attemptA?.releaseOrchestrationSeam();
+    attemptB?.releaseOrchestrationSeam();
     await Promise.allSettled(
       [attemptA, attemptB]
         .filter(

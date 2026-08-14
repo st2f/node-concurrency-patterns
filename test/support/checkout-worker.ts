@@ -2,13 +2,16 @@ import { fork, type ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
 import type { Checkout, CheckoutResult } from "../../src/checkout.ts";
+import { createAdvisoryLockCheckout } from "../../src/strategies/advisory-lock.ts";
 import { createKeyedMutexCheckout } from "../../src/strategies/keyed-mutex.ts";
 
 const { Pool } = pg;
 const IPC_TIMEOUT_MS = 5_000;
 
-export type CheckoutStrategyId = "keyed-mutex";
-export type CheckoutWorkerOrchestration = "pause-after-availability-read";
+export type CheckoutStrategyId = "keyed-mutex" | "advisory-lock";
+export type CheckoutWorkerOrchestration =
+  | "pause-after-availability-read"
+  | "pause-after-advisory-lock-acquired";
 
 export interface CheckoutWorkerPostgresConfig {
   host: string;
@@ -28,9 +31,9 @@ export interface SpawnCheckoutWorkerOptions {
 
 export interface CheckoutWorkerAttempt {
   attemptId: string;
-  atAvailabilityRead: Promise<void>;
+  atOrchestrationSeam: Promise<void>;
   result: Promise<CheckoutResult>;
-  releaseAvailabilityRead(): void;
+  releaseOrchestrationSeam(): void;
 }
 
 export interface CheckoutWorker {
@@ -50,8 +53,8 @@ interface CheckoutMessage {
   lockerId: number;
 }
 
-interface ReleaseAvailabilityReadMessage {
-  type: "release-availability-read";
+interface ReleaseOrchestrationSeamMessage {
+  type: "release-orchestration-seam";
   attemptId: string;
 }
 
@@ -62,15 +65,15 @@ interface CloseMessage {
 type ParentMessage =
   | InitializeMessage
   | CheckoutMessage
-  | ReleaseAvailabilityReadMessage
+  | ReleaseOrchestrationSeamMessage
   | CloseMessage;
 
 interface ReadyMessage {
   type: "ready";
 }
 
-interface AtAvailabilityReadMessage {
-  type: "at-availability-read";
+interface AtOrchestrationSeamMessage {
+  type: "at-orchestration-seam";
   attemptId: string;
 }
 
@@ -96,7 +99,7 @@ interface ClosedMessage {
 
 type WorkerMessage =
   | ReadyMessage
-  | AtAvailabilityReadMessage
+  | AtOrchestrationSeamMessage
   | ResultMessage
   | FailureMessage
   | ClosedMessage;
@@ -108,7 +111,7 @@ interface Deferred<T> {
 }
 
 interface AttemptState {
-  atAvailabilityRead: Deferred<void>;
+  atOrchestrationSeam: Deferred<void>;
   result: Deferred<CheckoutResult>;
 }
 
@@ -199,7 +202,7 @@ export async function spawnCheckoutWorker(
   function rejectPending(error: unknown): void {
     ready.reject(error);
     for (const attempt of attempts.values()) {
-      attempt.atAvailabilityRead.reject(error);
+      attempt.atOrchestrationSeam.reject(error);
       attempt.result.reject(error);
     }
     attempts.clear();
@@ -225,7 +228,7 @@ export async function spawnCheckoutWorker(
 
       const attempt = attempts.get(message.attemptId);
       if (attempt !== undefined) {
-        attempt.atAvailabilityRead.reject(error);
+        attempt.atOrchestrationSeam.reject(error);
         attempt.result.reject(error);
         attempts.delete(message.attemptId);
       }
@@ -235,8 +238,8 @@ export async function spawnCheckoutWorker(
     const attempt = attempts.get(message.attemptId);
     if (attempt === undefined) return;
 
-    if (message.type === "at-availability-read") {
-      attempt.atAvailabilityRead.resolve();
+    if (message.type === "at-orchestration-seam") {
+      attempt.atOrchestrationSeam.resolve();
     } else {
       attempt.result.resolve(message.result);
       attempts.delete(message.attemptId);
@@ -271,9 +274,9 @@ export async function spawnCheckoutWorker(
     pid,
     startCheckout(userId, lockerId) {
       const attemptId = `${pid}-${++attemptSequence}`;
-      const atAvailabilityRead = createDeferred<void>();
+      const atOrchestrationSeam = createDeferred<void>();
       const result = createDeferred<CheckoutResult>();
-      attempts.set(attemptId, { atAvailabilityRead, result });
+      attempts.set(attemptId, { atOrchestrationSeam, result });
 
       try {
         sendToWorker(child, {
@@ -284,24 +287,24 @@ export async function spawnCheckoutWorker(
         });
       } catch (error) {
         attempts.delete(attemptId);
-        atAvailabilityRead.reject(error);
+        atOrchestrationSeam.reject(error);
         result.reject(error);
       }
 
       return {
         attemptId,
-        atAvailabilityRead: waitWithTimeout(
-          atAvailabilityRead.promise,
-          `checkout attempt ${attemptId} reaching the availability seam`,
+        atOrchestrationSeam: waitWithTimeout(
+          atOrchestrationSeam.promise,
+          `checkout attempt ${attemptId} reaching its orchestration seam`,
         ),
         result: waitWithTimeout(
           result.promise,
           `checkout attempt ${attemptId} completing`,
         ),
-        releaseAvailabilityRead() {
+        releaseOrchestrationSeam() {
           if (child.connected) {
             sendToWorker(child, {
-              type: "release-availability-read",
+              type: "release-orchestration-seam",
               attemptId,
             });
           }
@@ -360,24 +363,45 @@ async function runWorker(): Promise<void> {
   function buildCheckout(
     strategy: CheckoutStrategyId,
     strategyPool: pg.Pool,
+    namespace: string,
   ): Checkout {
+    async function pauseAtOrchestrationSeam(
+      expected: CheckoutWorkerOrchestration,
+      seamDescription: string,
+    ): Promise<void> {
+      if (orchestration !== expected) return;
+      if (activeAttemptId === undefined) {
+        throw new Error(`${seamDescription} reached without an attempt`);
+      }
+
+      const attemptId = activeAttemptId;
+      sendFromWorker({ type: "at-orchestration-seam", attemptId });
+      if (releasedAttempts.delete(attemptId) || closing) return;
+
+      await new Promise<void>((resolve) => {
+        releaseActiveSeam = resolve;
+      });
+      releaseActiveSeam = undefined;
+    }
+
     switch (strategy) {
       case "keyed-mutex":
         return createKeyedMutexCheckout(strategyPool, {
           async afterAvailabilityRead() {
-            if (orchestration !== "pause-after-availability-read") return;
-            if (activeAttemptId === undefined) {
-              throw new Error("availability seam reached without an attempt");
-            }
-
-            const attemptId = activeAttemptId;
-            sendFromWorker({ type: "at-availability-read", attemptId });
-            if (releasedAttempts.delete(attemptId) || closing) return;
-
-            await new Promise<void>((resolve) => {
-              releaseActiveSeam = resolve;
-            });
-            releaseActiveSeam = undefined;
+            await pauseAtOrchestrationSeam(
+              "pause-after-availability-read",
+              "availability seam",
+            );
+          },
+        });
+      case "advisory-lock":
+        return createAdvisoryLockCheckout(strategyPool, {
+          lockNamespace: namespace,
+          async afterAdvisoryLockAcquired() {
+            await pauseAtOrchestrationSeam(
+              "pause-after-advisory-lock-acquired",
+              "advisory-lock seam",
+            );
           },
         });
     }
@@ -388,12 +412,12 @@ async function runWorker(): Promise<void> {
       if (pool !== undefined) throw new Error("worker is already initialized");
       orchestration = message.orchestration;
       pool = new Pool({ ...message.postgres, max: 1 });
-      checkout = buildCheckout(message.strategy, pool);
+      checkout = buildCheckout(message.strategy, pool, message.namespace);
       sendFromWorker({ type: "ready" });
       return;
     }
 
-    if (message.type === "release-availability-read") {
+    if (message.type === "release-orchestration-seam") {
       releasedAttempts.add(message.attemptId);
       if (activeAttemptId === message.attemptId) releaseActiveSeam?.();
       return;

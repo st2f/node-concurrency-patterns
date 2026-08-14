@@ -3,10 +3,10 @@ import { randomUUID } from "node:crypto";
 import { it } from "vitest";
 import type { CheckoutResult } from "../../../../src/checkout.ts";
 import { createAdvisoryLockCheckout } from "../../../../src/strategies/advisory-lock.ts";
+import { waitForPendingLockRequest } from "../../../support/advisory-lock.ts";
 import { createIsolatedTestDatabase } from "../../../support/database.ts";
 
 const WAIT_TIMEOUT_MS = 2_000;
-const POLL_INTERVAL_MS = 10;
 
 interface Barrier {
   promise: Promise<void>;
@@ -52,27 +52,6 @@ async function waitForBarrier(
   }
 }
 
-function delay(milliseconds: number): Promise<void> {
-  return new Promise((resolve) => {
-    const timeout = setTimeout(resolve, milliseconds);
-    timeout.unref();
-  });
-}
-
-async function waitForAdvisoryLockWaiter(
-  query: () => Promise<{ rowCount: number }>,
-): Promise<void> {
-  const deadline = Date.now() + WAIT_TIMEOUT_MS;
-
-  while (Date.now() < deadline) {
-    const result = await query();
-    if (result.rowCount > 0) return;
-    await delay(POLL_INTERVAL_MS);
-  }
-
-  assert.fail(`no advisory-lock waiter appeared within ${WAIT_TIMEOUT_MS}ms`);
-}
-
 it("makes a second connection wait for the same advisory lock", async () => {
   // A and B each hold a strategy connection. The third connection observes
   // their lock state without competing with them for pool capacity.
@@ -113,25 +92,7 @@ it("makes a second connection wait for the same advisory lock", async () => {
 
     attemptB = checkout("user-b", lockerId);
 
-    // A pending advisory-lock request exists only while a PostgreSQL connection
-    // is actively waiting to acquire the lock. Seeing this row therefore proves
-    // that B submitted its lock query and is blocked inside PostgreSQL, rather
-    // than simply not having run yet.
-    await waitForAdvisoryLockWaiter(async () => {
-      const waiting = await database.pool.query(
-        `
-          SELECT 1
-          FROM pg_locks
-          WHERE locktype = 'advisory'
-            AND granted = false
-            AND classid = hashtext($1::text)::oid
-            AND objid = $2::integer::oid
-            AND objsubid = 2
-        `,
-        [database.namespace, lockerId],
-      );
-      return { rowCount: waiting.rowCount ?? 0 };
-    });
+    await waitForPendingLockRequest(database, lockerId);
 
     assert.equal(
       seamVisits,
