@@ -8,8 +8,27 @@ import {
   type CheckoutWorkerAttempt,
 } from "../../../support/checkout-worker.ts";
 import { createIsolatedTestDatabase } from "../../../support/database.ts";
+import { createTracer } from "../../../support/trace.ts";
 
+/*
+Scenario:
+
+checkout messages sent
+    ↓
+seamA fulfilled
+seamB fulfilled
+    ↓
+both processes parked
+    ↓
+release messages sent
+    ↓
+resultA fulfilled
+resultB fulfilled
+    ↓
+both attempts finished
+*/
 it("allows both checkout attempts to win across application processes", async () => {
+  const trace = createTracer("topology");
   const database = await createIsolatedTestDatabase({ maxConnections: 1 });
   let workerA: CheckoutWorker | undefined;
   let workerB: CheckoutWorker | undefined;
@@ -45,6 +64,17 @@ it("allows both checkout attempts to win across application processes", async ()
     attemptA = workerA.startCheckout("user-a", lockerId);
     attemptB = workerB.startCheckout("user-b", lockerId);
 
+    const states = {
+      seamA: attemptA.atAvailabilityRead,
+      seamB: attemptB.atAvailabilityRead,
+      resultA: attemptA.result,
+      resultB: attemptB.result,
+    };
+    for (const [name, promise] of Object.entries(states)) {
+      trace.watch(name, promise);
+    }
+    trace.mark("checkout messages sent", states);
+
     // Neither attempt is released until both processes report reaching the
     // seam. Therefore both are simultaneously inside critical sections owned
     // by different in-memory mutex instances.
@@ -52,14 +82,20 @@ it("allows both checkout attempts to win across application processes", async ()
       attemptA.atAvailabilityRead,
       attemptB.atAvailabilityRead,
     ]);
+    trace.mark("both processes parked at the seam", states);
 
     attemptA.releaseAvailabilityRead();
     attemptB.releaseAvailabilityRead();
+    // Sending an IPC message settles nothing synchronously: both results are
+    // still pending here, and stay pending until each child replies.
+    trace.mark("release messages sent", states);
 
     const [resultA, resultB] = await Promise.all([
       attemptA.result,
       attemptB.result,
     ]);
+    trace.mark("both attempts finished", states);
+
     assert.equal(resultA.outcome, "checked_out");
     assert.equal(resultB.outcome, "checked_out");
     assert.notEqual(resultA.checkoutId, resultB.checkoutId);
@@ -81,16 +117,13 @@ it("allows both checkout attempts to win across application processes", async ()
     await Promise.allSettled(
       [attemptA, attemptB]
         .filter(
-          (attempt): attempt is CheckoutWorkerAttempt =>
-            attempt !== undefined,
+          (attempt): attempt is CheckoutWorkerAttempt => attempt !== undefined,
         )
         .map((attempt) => attempt.result),
     );
     await Promise.allSettled(
       [workerA, workerB]
-        .filter(
-          (worker): worker is CheckoutWorker => worker !== undefined,
-        )
+        .filter((worker): worker is CheckoutWorker => worker !== undefined)
         .map((worker) => worker.close()),
     );
     await database.close();
