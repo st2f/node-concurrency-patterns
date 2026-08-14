@@ -66,7 +66,8 @@ Control the point where callers contend so the test proves why a strategy
 works. For example:
 
 - Keep caller A inside a keyed mutex and prove caller B waits.
-- Hold a Postgres advisory lock and prove another connection waits.
+- Under Postgres `READ COMMITTED` isolation, hold an advisory lock
+  and prove another connection waits.
 - Make two optimistic writers use the same version.
 - Coordinate Redis lock holders with child-process messages.
 
@@ -96,11 +97,16 @@ The queue is ordinary JavaScript memory. It works when every caller uses the
 same checkout instance in one process. Two serverless invocations or container
 replicas have different queues, so the mutex cannot coordinate between them.
 
-### Postgres advisory lock
+### Postgres advisory lock with READ COMMITTED
 
 Acquire `pg_advisory_xact_lock(...)` inside the transaction before checking the
 locker. Every process using the same lock key asks Postgres for the same lock,
 so Postgres serializes them.
+
+This strategy depends on PostgreSQL `READ COMMITTED` transaction
+isolation. Each statement receives a new snapshot, so a caller that waited for
+the advisory lock runs its availability query against a snapshot taken after
+the previous holder commits. Using `REPEATABLE READ` or `SERIALIZABLE` would require different snapshot and retry handling.
 
 The transaction-scoped lock is automatically released on commit or rollback.
 All code paths that modify this state must follow the locking convention.
@@ -215,4 +221,4 @@ not, by itself, a fencing-token implementation.
 
 - [Strategy comparison](comparison.md)
 - [Test overview](tests-overview.md)
-- [Incremental learning steps](learning-steps.md)
+- [Implementation](implementation.md)

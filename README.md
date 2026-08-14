@@ -7,7 +7,7 @@ The project uses a simple locker checkout invariant: **a locker can have at most
 The strategies include:
 
 - in-process keyed mutexes
-- PostgreSQL advisory locks
+- PostgreSQL advisory locks with `READ COMMITTED` isolation
 - Redis-based distributed locks
 - optimistic concurrency control
 - PostgreSQL constraints

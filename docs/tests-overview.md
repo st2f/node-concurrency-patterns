@@ -34,7 +34,7 @@ Deliberately exercise the synchronization mechanism:
 
 ```text
 mutex → hold callback A → verify B waits
-advisory → hold PG lock A → verify B waits
+advisory (READ COMMITTED) → hold PG lock A → verify B waits
 Redis → holder A → verify B can't acquire
 optimistic → same version → verify one UPDATE affects zero rows
 DB constraint → concurrent INSERTs → verify one fails with SQLSTATE 23505
@@ -48,7 +48,8 @@ So 1b tests behavior, while 1c tests the mechanism.
              one process       two processes
                   │                  │
 keyed mutex       ✓                  ✗
-PG advisory       ✓                  ✓
+PG advisory
+(READ COMMITTED)  ✓                  ✓
 Redis + storage
 validation        ✓                  ✓
 optimistic        ✓                  ✓
