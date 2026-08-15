@@ -298,13 +298,14 @@ the strategy migration to its selected migration path.
 | Test                                                                                         | Status and evidence                                                                                                                                           |
 | -------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | [Shared contract](../test/integration/strategies/unique-constraint/contract.test.ts)         | Complete. Sixteen concurrent calls produce one winner, every other caller returns `unavailable`, and PostgreSQL contains one active checkout.                 |
-| [Constraint collision](../test/integration/strategies/unique-constraint/constraint-collision.test.ts) | Pending. This will prove that concurrent active-row inserts collide with SQLSTATE `23505` and that a released historical row does not prevent another checkout. |
+| [Constraint collision](../test/integration/strategies/unique-constraint/constraint-collision.test.ts) | Caller B waits on caller A's uncommitted active row, then receives SQLSTATE `23505` for the named index after A commits. A released historical row permits a later active checkout. |
 | [Two-process topology](../test/integration/strategies/unique-constraint/topology.test.ts)    | Pending. The index lives in PostgreSQL, so it is expected to protect the invariant across Node.js processes, but that claim has not yet been tested explicitly. |
 
-The completed contract establishes the black-box behavior within one process
-under likely contention. The pending collision test will isolate the database
-mechanism and verify the partial predicate. The pending topology test will
-provide direct evidence for the cross-process guarantee.
+The contract establishes the black-box behavior within one process under
+likely contention. The collision tests isolate the database mechanism: they
+observe the losing insert waiting inside PostgreSQL, verify the exact error
+identity, and exercise the partial predicate after release. The pending
+topology test will provide direct evidence for the cross-process guarantee.
 
 ### Tradeoffs
 
