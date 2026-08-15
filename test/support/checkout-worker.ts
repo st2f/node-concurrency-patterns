@@ -4,14 +4,19 @@ import pg from "pg";
 import type { Checkout, CheckoutResult } from "../../src/checkout.ts";
 import { createAdvisoryLockCheckout } from "../../src/strategies/advisory-lock.ts";
 import { createKeyedMutexCheckout } from "../../src/strategies/keyed-mutex.ts";
+import { createOptimisticLockingCheckout } from "../../src/strategies/optimistic-locking.ts";
 
 const { Pool } = pg;
 const IPC_TIMEOUT_MS = 5_000;
 
-export type CheckoutStrategyId = "keyed-mutex" | "advisory-lock";
+export type CheckoutStrategyId =
+  | "keyed-mutex"
+  | "advisory-lock"
+  | "optimistic-locking";
 export type CheckoutWorkerOrchestration =
   | "pause-after-availability-read"
-  | "pause-after-advisory-lock-acquired";
+  | "pause-after-advisory-lock-acquired"
+  | "pause-after-version-read";
 
 export interface CheckoutWorkerPostgresConfig {
   host: string;
@@ -401,6 +406,21 @@ async function runWorker(): Promise<void> {
             await pauseAtOrchestrationSeam(
               "pause-after-advisory-lock-acquired",
               "advisory-lock seam",
+            );
+          },
+        });
+      case "optimistic-locking":
+        return createOptimisticLockingCheckout(strategyPool, {
+          async afterVersionRead(state) {
+            // Both processes pause after their initial read while the locker
+            // is available. After one process advances the version, the
+            // loser's conditional UPDATE matches no row and it reads again.
+            // That second read sees the winner's checkout, so let it continue
+            // to `unavailable` without introducing another IPC pause.
+            if (!state.available) return;
+            await pauseAtOrchestrationSeam(
+              "pause-after-version-read",
+              "version-read seam",
             );
           },
         });

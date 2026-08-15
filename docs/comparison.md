@@ -6,11 +6,11 @@ still pending.
 
 ## At a glance
 
-| Strategy                                  | Coordination lives in                             | Works in one process          | Works across processes          | Best fit                                                              |
-| ----------------------------------------- | ------------------------------------------------- | ----------------------------- | ------------------------------- | --------------------------------------------------------------------- |
-| Keyed mutex                               | A JavaScript `Map` owned by one checkout instance | Yes, with one shared instance | No                              | A single writer process, or a local optimization above a shared guard |
-| Postgres advisory lock (`READ COMMITTED`) | PostgreSQL's advisory-lock manager                | Yes                           | Yes                             | Multiple application processes sharing one Postgres database          |
-| Optimistic locking                        | A version column on the PostgreSQL locker row     | Yes                           | Expected; topology test pending | Low-contention writes where callers can retry after conflicts         |
+| Strategy                                  | Coordination lives in                             | Works in one process          | Works across processes | Best fit                                                              |
+| ----------------------------------------- | ------------------------------------------------- | ----------------------------- | ---------------------- | --------------------------------------------------------------------- |
+| Keyed mutex                               | A JavaScript `Map` owned by one checkout instance | Yes, with one shared instance | No                     | A single writer process, or a local optimization above a shared guard |
+| Postgres advisory lock (`READ COMMITTED`) | PostgreSQL's advisory-lock manager                | Yes                           | Yes                    | Multiple application processes sharing one Postgres database          |
+| Optimistic locking                        | A version column on the PostgreSQL locker row     | Yes                           | Yes                    | Low-contention writes where callers can retry after conflicts         |
 
 "Works across processes" is especially important for containers and
 serverless functions. Each running instance has its own JavaScript memory.
@@ -198,17 +198,18 @@ newly committed row.
 
 ### What the tests prove
 
-| Test                                                                                           | Status and evidence                                                                                                                                               |
-| ---------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [Shared contract](../test/integration/strategies/optimistic-locking/contract.test.ts)          | Complete. Sixteen concurrent calls produce one winner, every other caller returns `unavailable`, and PostgreSQL contains one active checkout.                     |
-| [Version conflict](../test/integration/strategies/optimistic-locking/version-conflict.test.ts) | Complete. Both callers pause after reading version `0`; one wins, while the loser re-reads version `1` after its conditional update affects zero rows.             |
-| [Two-process topology](../test/integration/strategies/optimistic-locking/topology.test.ts)     | Pending. Because the compared version lives in PostgreSQL, the strategy is expected to coordinate separate Node.js processes, but that claim is not yet verified. |
+| Test                                                                                           | Status and evidence                                                                                                                           |
+| ---------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| [Shared contract](../test/integration/strategies/optimistic-locking/contract.test.ts)          | Sixteen concurrent calls produce one winner, every other caller returns `unavailable`, and PostgreSQL contains one active checkout.           |
+| [Version conflict](../test/integration/strategies/optimistic-locking/version-conflict.test.ts) | Both callers pause after reading version `0`; one wins, while the loser re-reads version `1` after its conditional update affects zero rows.  |
+| [Two-process topology](../test/integration/strategies/optimistic-locking/topology.test.ts)     | Two child processes read version `0`; PostgreSQL accepts one conditional update, producing one winner and one active checkout at version `1`. |
 
 The contract establishes the intended black-box behavior within one process.
 The version-conflict test supplies the deterministic mechanism evidence that
 the contract cannot: both writers compare the same version, but only one
-advances it and inserts a checkout. The cross-process claim remains
-provisional until its topology test is implemented.
+advances it and inserts a checkout. The topology test proves that this
+coordination crosses Node.js process boundaries because the compared state
+lives in PostgreSQL rather than application memory.
 
 ### Tradeoffs
 
