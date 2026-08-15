@@ -5,56 +5,10 @@ import { it } from "vitest";
 import type { CheckoutResult } from "../../../../src/checkout.ts";
 import { createKeyedMutexCheckout } from "../../../../src/strategies/keyed-mutex.ts";
 import { createIsolatedTestDatabase } from "../../../support/database.ts";
-
-const SEAM_TIMEOUT_MS = 2_000;
-
-interface Barrier {
-  promise: Promise<void>;
-  release(): void;
-}
-
-function createBarrier(): Barrier {
-  let release!: () => void;
-  const promise = new Promise<void>((resolve) => {
-    release = resolve;
-  });
-
-  return { promise, release };
-}
-
-async function waitForSeam(
-  barrier: Barrier,
-  attempt: Promise<CheckoutResult>,
-): Promise<void> {
-  const finishedBeforeSeam = attempt.then(
-    (result) => {
-      throw new Error(
-        `checkout finished with ${result.outcome} before reaching the seam`,
-      );
-    },
-    (error: unknown) => {
-      throw error;
-    },
-  );
-
-  let timeout: ReturnType<typeof setTimeout> | undefined;
-  const timedOut = new Promise<never>((_, reject) => {
-    timeout = setTimeout(() => {
-      reject(
-        new Error(
-          `checkout did not reach the seam within ${SEAM_TIMEOUT_MS}ms`,
-        ),
-      );
-    }, SEAM_TIMEOUT_MS);
-    timeout.unref();
-  });
-
-  try {
-    await Promise.race([barrier.promise, finishedBeforeSeam, timedOut]);
-  } finally {
-    if (timeout !== undefined) clearTimeout(timeout);
-  }
-}
+import {
+  createTestSignal,
+  waitForSignal,
+} from "../../../support/orchestration.ts";
 
 function drainEventLoop(): Promise<void> {
   return new Promise((resolve) => {
@@ -64,9 +18,9 @@ function drainEventLoop(): Promise<void> {
 
 it("queues keyed-mutex callers for the same locker", async () => {
   const database = await createIsolatedTestDatabase({ maxConnections: 2 });
-  const firstAtAvailabilityRead = createBarrier();
-  const releaseFirstCaller = createBarrier();
-  const secondAtAvailabilityRead = createBarrier();
+  const firstAtAvailabilityRead = createTestSignal();
+  const releaseFirstCaller = createTestSignal();
+  const secondAtAvailabilityRead = createTestSignal();
   let seamVisits = 0;
   let connectAttempts = 0;
   let attemptA: Promise<CheckoutResult> | undefined;
@@ -111,7 +65,11 @@ it("queues keyed-mutex callers for the same locker", async () => {
     assert.ok(lockerId !== undefined);
 
     attemptA = checkout("user-a", lockerId);
-    await waitForSeam(firstAtAvailabilityRead, attemptA);
+    await waitForSignal(
+      firstAtAvailabilityRead,
+      [attemptA],
+      "caller A to reach the availability-read seam",
+    );
 
     attemptB = checkout("user-b", lockerId);
     await drainEventLoop();
@@ -128,7 +86,11 @@ it("queues keyed-mutex callers for the same locker", async () => {
     );
 
     releaseFirstCaller.release();
-    await waitForSeam(secondAtAvailabilityRead, attemptB);
+    await waitForSignal(
+      secondAtAvailabilityRead,
+      [attemptB],
+      "caller B to reach the availability-read seam",
+    );
 
     const [resultA, resultB] = await Promise.all([attemptA, attemptB]);
     assert.equal(resultA.outcome, "checked_out");
@@ -151,9 +113,9 @@ it("does not block concurrent keyed-mutex checkouts for different lockers", asyn
   // One connection per caller: both must be in flight at the same time, and
   // neither may wait on the pool for the other to finish.
   const database = await createIsolatedTestDatabase({ maxConnections: 2 });
-  const firstAtAvailabilityRead = createBarrier();
-  const releaseFirstCaller = createBarrier();
-  const secondAtAvailabilityRead = createBarrier();
+  const firstAtAvailabilityRead = createTestSignal();
+  const releaseFirstCaller = createTestSignal();
+  const secondAtAvailabilityRead = createTestSignal();
   let seamVisits = 0;
   let attemptA: Promise<CheckoutResult> | undefined;
   let attemptB: Promise<CheckoutResult> | undefined;
@@ -183,12 +145,20 @@ it("does not block concurrent keyed-mutex checkouts for different lockers", asyn
     assert.ok(firstLocker !== undefined && secondLocker !== undefined);
 
     attemptA = checkout("user-a", firstLocker);
-    await waitForSeam(firstAtAvailabilityRead, attemptA);
+    await waitForSignal(
+      firstAtAvailabilityRead,
+      [attemptA],
+      "caller A to reach the availability-read seam",
+    );
 
     // A remains inside its locker's critical section. Because B uses another
     // locker, it must reach the seam without waiting for A to be released.
     attemptB = checkout("user-b", secondLocker);
-    await waitForSeam(secondAtAvailabilityRead, attemptB);
+    await waitForSignal(
+      secondAtAvailabilityRead,
+      [attemptB],
+      "caller B to reach the availability-read seam",
+    );
     assert.equal(seamVisits, 2);
 
     releaseFirstCaller.release();

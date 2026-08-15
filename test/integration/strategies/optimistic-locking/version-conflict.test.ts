@@ -7,60 +7,18 @@ import {
   type OptimisticLockingVersionRead,
 } from "../../../../src/strategies/optimistic-locking.ts";
 import { createIsolatedTestDatabase } from "../../../support/database.ts";
+import {
+  createTestSignal,
+  waitForSignal,
+} from "../../../support/orchestration.ts";
 import { promiseState } from "../../../support/trace.ts";
-
-const WAIT_TIMEOUT_MS = 2_000;
-
-interface Barrier {
-  promise: Promise<void>;
-  release(): void;
-}
-
-function createBarrier(): Barrier {
-  let release!: () => void;
-  const promise = new Promise<void>((resolve) => {
-    release = resolve;
-  });
-
-  return { promise, release };
-}
-
-async function waitForBarrier(
-  barrier: Barrier,
-  attempts: Promise<CheckoutResult>[],
-): Promise<void> {
-  let timeout: ReturnType<typeof setTimeout> | undefined;
-  const timedOut = new Promise<never>((_, reject) => {
-    timeout = setTimeout(() => {
-      reject(new Error(`barrier was not reached within ${WAIT_TIMEOUT_MS}ms`));
-    }, WAIT_TIMEOUT_MS);
-    timeout.unref();
-  });
-
-  const finishedBeforeBarrier = Promise.race(attempts).then(
-    (result) => {
-      throw new Error(
-        `checkout finished with ${result.outcome} before reaching the barrier`,
-      );
-    },
-    (error: unknown) => {
-      throw error;
-    },
-  );
-
-  try {
-    await Promise.race([barrier.promise, finishedBeforeBarrier, timedOut]);
-  } finally {
-    if (timeout !== undefined) clearTimeout(timeout);
-  }
-}
 
 it("allows only one writer to update when both read the same version", async () => {
   // A and B each hold a strategy connection while the third connection
   // verifies the database state at the orchestration boundary.
   const database = await createIsolatedTestDatabase({ maxConnections: 3 });
-  const bothReadInitialVersion = createBarrier();
-  const releaseInitialReaders = createBarrier();
+  const bothReadInitialVersion = createTestSignal();
+  const releaseInitialReaders = createTestSignal();
   const versionReads: OptimisticLockingVersionRead[] = [];
   let attemptA: Promise<CheckoutResult> | undefined;
   let attemptB: Promise<CheckoutResult> | undefined;
@@ -95,7 +53,11 @@ it("allows only one writer to update when both read the same version", async () 
 
     attemptA = checkout("user-a", lockerId);
     attemptB = checkout("user-b", lockerId);
-    await waitForBarrier(bothReadInitialVersion, [attemptA, attemptB]);
+    await waitForSignal(
+      bothReadInitialVersion,
+      [attemptA, attemptB],
+      "both callers to read the initial version",
+    );
 
     assert.deepEqual(versionReads, [
       { version: 0, available: true },
