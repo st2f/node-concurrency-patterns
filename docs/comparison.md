@@ -11,7 +11,7 @@ still pending.
 | Keyed mutex                               | A JavaScript `Map` owned by one checkout instance | Yes, with one shared instance | No                     | A single writer process, or a local optimization above a shared guard |
 | Postgres advisory lock (`READ COMMITTED`) | PostgreSQL's advisory-lock manager                | Yes                           | Yes                    | Multiple application processes sharing one Postgres database          |
 | Optimistic locking                        | A version column on the PostgreSQL locker row     | Yes                           | Yes                    | Low-contention writes where callers can retry after conflicts         |
-| Database uniqueness rule                  | A PostgreSQL partial unique index                 | Yes                           | Expected; test pending | Invariants that can be expressed directly in the database schema      |
+| Database uniqueness rule                  | A PostgreSQL partial unique index                 | Yes                           | Yes                    | Invariants that can be expressed directly in the database schema      |
 
 "Works across processes" is especially important for containers and
 serverless functions. Each running instance has its own JavaScript memory.
@@ -295,17 +295,18 @@ the strategy migration to its selected migration path.
 
 ### What the tests prove
 
-| Test                                                                                         | Status and evidence                                                                                                                                           |
-| -------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [Shared contract](../test/integration/strategies/unique-constraint/contract.test.ts)         | Complete. Sixteen concurrent calls produce one winner, every other caller returns `unavailable`, and PostgreSQL contains one active checkout.                 |
+| Test                                                                                                  | Status and evidence                                                                                                                                                                 |
+| ----------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [Shared contract](../test/integration/strategies/unique-constraint/contract.test.ts)                  | Sixteen concurrent calls produce one winner, every other caller returns `unavailable`, and PostgreSQL contains one active checkout.                                                 |
 | [Constraint collision](../test/integration/strategies/unique-constraint/constraint-collision.test.ts) | Caller B waits on caller A's uncommitted active row, then receives SQLSTATE `23505` for the named index after A commits. A released historical row permits a later active checkout. |
-| [Two-process topology](../test/integration/strategies/unique-constraint/topology.test.ts)    | Pending. The index lives in PostgreSQL, so it is expected to protect the invariant across Node.js processes, but that claim has not yet been tested explicitly. |
+| [Two-process topology](../test/integration/strategies/unique-constraint/topology.test.ts)             | Two child processes pause before inserting into the same isolated schema. PostgreSQL accepts one active row, and the other process returns `unavailable`.                           |
 
 The contract establishes the black-box behavior within one process under
 likely contention. The collision tests isolate the database mechanism: they
 observe the losing insert waiting inside PostgreSQL, verify the exact error
-identity, and exercise the partial predicate after release. The pending
-topology test will provide direct evidence for the cross-process guarantee.
+identity, and exercise the partial predicate after release. The topology test
+proves the same database rule protects the invariant when no application
+memory is shared between callers.
 
 ### Tradeoffs
 

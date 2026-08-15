@@ -5,6 +5,10 @@ const { DatabaseError } = pg;
 const UNIQUE_VIOLATION = "23505";
 const ACTIVE_CHECKOUT_CONSTRAINT = "one_active_checkout_per_locker";
 
+export interface UniqueConstraintCheckoutOptions {
+  beforeInsert?(): Promise<void>;
+}
+
 function isActiveCheckoutConflict(error: unknown): boolean {
   return (
     error instanceof DatabaseError &&
@@ -17,8 +21,13 @@ function isActiveCheckoutConflict(error: unknown): boolean {
  * Create a checkout operation whose concurrency guarantee comes from the
  * partial unique index installed by this strategy's schema migration.
  */
-export function createUniqueConstraintCheckout(pool: Pool): Checkout {
+export function createUniqueConstraintCheckout(
+  pool: Pool,
+  options: UniqueConstraintCheckoutOptions = {},
+): Checkout {
   return async (userId, lockerId) => {
+    await options.beforeInsert?.();
+
     try {
       // There is deliberately no read-before-write availability check here.
       // The INSERT is the attempt to claim the locker, and PostgreSQL chooses

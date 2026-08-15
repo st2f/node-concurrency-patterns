@@ -5,6 +5,7 @@ import type { Checkout, CheckoutResult } from "../../src/checkout.ts";
 import { createAdvisoryLockCheckout } from "../../src/strategies/advisory-lock.ts";
 import { createKeyedMutexCheckout } from "../../src/strategies/keyed-mutex.ts";
 import { createOptimisticLockingCheckout } from "../../src/strategies/optimistic-locking.ts";
+import { createUniqueConstraintCheckout } from "../../src/strategies/unique-constraint.ts";
 
 const { Pool } = pg;
 const IPC_TIMEOUT_MS = 5_000;
@@ -12,11 +13,13 @@ const IPC_TIMEOUT_MS = 5_000;
 export type CheckoutStrategyId =
   | "keyed-mutex"
   | "advisory-lock"
-  | "optimistic-locking";
+  | "optimistic-locking"
+  | "unique-constraint";
 export type CheckoutWorkerOrchestration =
   | "pause-after-availability-read"
   | "pause-after-advisory-lock-acquired"
-  | "pause-after-version-read";
+  | "pause-after-version-read"
+  | "pause-before-insert";
 
 export interface CheckoutWorkerPostgresConfig {
   host: string;
@@ -421,6 +424,15 @@ async function runWorker(): Promise<void> {
             await pauseAtOrchestrationSeam(
               "pause-after-version-read",
               "version-read seam",
+            );
+          },
+        });
+      case "unique-constraint":
+        return createUniqueConstraintCheckout(strategyPool, {
+          async beforeInsert() {
+            await pauseAtOrchestrationSeam(
+              "pause-before-insert",
+              "pre-insert seam",
             );
           },
         });
