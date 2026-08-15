@@ -201,14 +201,14 @@ newly committed row.
 | Test                                                                                           | Status and evidence                                                                                                                                               |
 | ---------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | [Shared contract](../test/integration/strategies/optimistic-locking/contract.test.ts)          | Complete. Sixteen concurrent calls produce one winner, every other caller returns `unavailable`, and PostgreSQL contains one active checkout.                     |
-| [Version conflict](../test/integration/strategies/optimistic-locking/version-conflict.test.ts) | Pending. This will make two writers read the same version and prove that exactly one conditional update affects a row.                                            |
+| [Version conflict](../test/integration/strategies/optimistic-locking/version-conflict.test.ts) | Complete. Both callers pause after reading version `0`; one wins, while the loser re-reads version `1` after its conditional update affects zero rows.             |
 | [Two-process topology](../test/integration/strategies/optimistic-locking/topology.test.ts)     | Pending. Because the compared version lives in PostgreSQL, the strategy is expected to coordinate separate Node.js processes, but that claim is not yet verified. |
 
-The completed contract establishes the intended black-box behavior within one
-process. It makes contention likely but does not deterministically prove that
-two writers compared the same version. That evidence belongs to the pending
-version-conflict test. The cross-process claim likewise remains provisional
-until its topology test is implemented.
+The contract establishes the intended black-box behavior within one process.
+The version-conflict test supplies the deterministic mechanism evidence that
+the contract cannot: both writers compare the same version, but only one
+advances it and inserts a checkout. The cross-process claim remains
+provisional until its topology test is implemented.
 
 ### Tradeoffs
 

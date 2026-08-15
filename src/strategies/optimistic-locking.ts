@@ -2,7 +2,12 @@ import type { Pool } from "pg";
 import type { Checkout } from "../checkout.ts";
 
 export interface OptimisticLockingCheckoutOptions {
-  afterVersionRead?(): Promise<void>;
+  afterVersionRead?(state: OptimisticLockingVersionRead): Promise<void>;
+}
+
+export interface OptimisticLockingVersionRead {
+  version: number;
+  available: boolean;
 }
 
 interface LockerState {
@@ -45,7 +50,10 @@ export function createOptimisticLockingCheckout(
           throw new Error(`locker ${lockerId} does not exist`);
         }
 
-        await options.afterVersionRead?.();
+        await options.afterVersionRead?.({
+          version: locker.version,
+          available: locker.available,
+        });
 
         if (!locker.available) {
           await client.query("COMMIT");
