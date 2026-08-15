@@ -10,6 +10,7 @@ still pending.
 | ----------------------------------------- | ------------------------------------------------- | ----------------------------- | ------------------------------- | --------------------------------------------------------------------- |
 | Keyed mutex                               | A JavaScript `Map` owned by one checkout instance | Yes, with one shared instance | No                              | A single writer process, or a local optimization above a shared guard |
 | Postgres advisory lock (`READ COMMITTED`) | PostgreSQL's advisory-lock manager                | Yes                           | Yes                             | Multiple application processes sharing one Postgres database          |
+| Optimistic locking                        | A version column on the PostgreSQL locker row     | Yes                           | Expected; topology test pending | Low-contention writes where callers can retry after conflicts         |
 
 "Works across processes" is especially important for containers and
 serverless functions. Each running instance has its own JavaScript memory.
@@ -119,11 +120,11 @@ run concurrently because a collision makes them share a lock.
 
 ### What the tests prove
 
-| Test                                                                                    | Status and evidence                                                                                                                      |
-| --------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| [Shared contract](../test/integration/strategies/advisory-lock/contract.test.ts)        | Complete. Many concurrent calls produce one winner, every other caller returns `unavailable`, and Postgres contains one active checkout. |
-| [Lock contention](../test/integration/strategies/advisory-lock/lock-contention.test.ts) | Complete. Caller A pauses while holding the lock; `pg_locks` shows caller B waiting for that exact key. B acquires it only after A is released. |
-| [Two-process topology](../test/integration/strategies/advisory-lock/topology.test.ts)   | Complete. Two explicit Node.js child processes request the same lock key. PostgreSQL makes B wait for A, producing one active checkout.   |
+| Test                                                                                    | Status and evidence                                                                                                                   |
+| --------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| [Shared contract](../test/integration/strategies/advisory-lock/contract.test.ts)        | Many concurrent calls produce one winner, every other caller returns `unavailable`, and Postgres contains one active checkout.        |
+| [Lock contention](../test/integration/strategies/advisory-lock/lock-contention.test.ts) | Caller A pauses while holding the lock; `pg_locks` shows caller B waiting for that exact key. B acquires it only after A is released. |
+| [Two-process topology](../test/integration/strategies/advisory-lock/topology.test.ts)   | Two explicit Node.js child processes request the same lock key. PostgreSQL makes B wait for A, producing one active checkout.         |
 
 The contract establishes the behavior in one process, the contention test
 proves that PostgreSQL serializes callers requesting the same key, and the
@@ -158,3 +159,84 @@ It is less attractive when lock waits would occupy scarce pool connections,
 or when not every writer can be required to use the same convention. If an
 invariant can be expressed directly as a PostgreSQL constraint, enforcing it
 in the schema provides a stronger guard against bypassing application code.
+
+## Optimistic locking
+
+### How it works
+
+`createOptimisticLockingCheckout()` reads the locker's availability and
+current `version` without first taking an application-level or advisory lock.
+If the locker appears available, it tries to claim the observed version:
+
+```sql
+UPDATE lockers
+SET version = version + 1
+WHERE id = $1 AND version = $2;
+```
+
+The `pg` query result's `rowCount` distinguishes the outcomes:
+
+```text
+rowCount = 1 → this caller claimed the version → insert checkout → commit
+rowCount = 0 → another writer changed it       → read fresh state again
+```
+
+The version update and checkout insert share one transaction. PostgreSQL
+therefore cannot expose the increment without its corresponding checkout, and
+a failed insert rolls both changes back.
+
+The transaction uses `READ COMMITTED`. After a zero-row conditional update,
+the loop's next query gets a fresh snapshot. It normally sees the winning
+caller's active checkout and returns `unavailable`. If the conflicting change
+instead made the locker available, the caller can retry with the new version.
+
+Optimistic locking avoids making callers queue before reading, but it does not
+mean PostgreSQL never waits internally. Concurrent conditional updates of the
+same row can briefly wait on PostgreSQL's row lock while the winning
+transaction finishes. The version predicate is then checked against the
+newly committed row.
+
+### What the tests prove
+
+| Test                                                                                           | Status and evidence                                                                                                                                               |
+| ---------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [Shared contract](../test/integration/strategies/optimistic-locking/contract.test.ts)          | Complete. Sixteen concurrent calls produce one winner, every other caller returns `unavailable`, and PostgreSQL contains one active checkout.                     |
+| [Version conflict](../test/integration/strategies/optimistic-locking/version-conflict.test.ts) | Pending. This will make two writers read the same version and prove that exactly one conditional update affects a row.                                            |
+| [Two-process topology](../test/integration/strategies/optimistic-locking/topology.test.ts)     | Pending. Because the compared version lives in PostgreSQL, the strategy is expected to coordinate separate Node.js processes, but that claim is not yet verified. |
+
+The completed contract establishes the intended black-box behavior within one
+process. It makes contention likely but does not deterministically prove that
+two writers compared the same version. That evidence belongs to the pending
+version-conflict test. The cross-process claim likewise remains provisional
+until its topology test is implemented.
+
+### Tradeoffs
+
+- **No external lock service.** The mechanism uses an ordinary PostgreSQL
+  column and conditional `UPDATE`; there is no lock key or lease to manage.
+- **Conflicts become application control flow.** A zero-row update is an
+  expected race outcome, not an infrastructure error. The application must
+  re-read and decide whether to retry or return `unavailable`.
+- **Best under low contention.** Callers do useful work concurrently when
+  conflicts are rare. A hot locker causes repeated reads, failed conditional
+  updates, and database row-lock waits.
+- **All relevant writers must advance the version.** Checkout, release, and
+  any other operation that changes availability must update the same locker
+  version in its transaction. A direct checkout insert that does not advance
+  the version bypasses this protection.
+- **The version is state, not ownership.** It detects that the row changed
+  since a read; it does not identify a lock holder or impose the acquisition
+  ordering provided by a fencing token.
+
+### When to use it
+
+Optimistic locking fits when conflicting updates are uncommon, callers can
+cheaply re-read after losing a race, and every writer shares PostgreSQL and
+follows the version convention. It avoids introducing a separate coordination
+system and allows unrelated lockers to proceed independently.
+
+It is less attractive for highly contended rows or operations whose work is
+expensive to repeat. It also does not protect against code paths that modify
+the invariant without participating in the version update. When the business
+rule can be expressed directly as a database constraint, the constraint is a
+stronger final line of defense.

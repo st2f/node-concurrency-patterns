@@ -33,6 +33,11 @@ framework abstraction.
 - Docker Compose starts Postgres and Redis.
 - SQL migrations create and evolve the Postgres schema.
 
+The checkout table keeps historical records:
+
+- released_at = NULL → checkout is active; locker is unavailable
+- released_at = timestamp → checkout ended; locker is available again
+
 ## Step 1 — Establish the tests
 
 ### Baseline race
