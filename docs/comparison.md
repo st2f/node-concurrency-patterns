@@ -11,6 +11,7 @@ still pending.
 | Keyed mutex                               | A JavaScript `Map` owned by one checkout instance | Yes, with one shared instance | No                     | A single writer process, or a local optimization above a shared guard |
 | Postgres advisory lock (`READ COMMITTED`) | PostgreSQL's advisory-lock manager                | Yes                           | Yes                    | Multiple application processes sharing one Postgres database          |
 | Optimistic locking                        | A version column on the PostgreSQL locker row     | Yes                           | Yes                    | Low-contention writes where callers can retry after conflicts         |
+| Database uniqueness rule                  | A PostgreSQL partial unique index                 | Yes                           | Expected; test pending | Invariants that can be expressed directly in the database schema      |
 
 "Works across processes" is especially important for containers and
 serverless functions. Each running instance has its own JavaScript memory.
@@ -241,3 +242,97 @@ expensive to repeat. It also does not protect against code paths that modify
 the invariant without participating in the version update. When the business
 rule can be expressed directly as a database constraint, the constraint is a
 stronger final line of defense.
+
+## Database uniqueness rule
+
+### How it works
+
+The schema expresses the invariant with a partial unique index:
+
+```sql
+CREATE UNIQUE INDEX one_active_checkout_per_locker
+ON checkouts (locker_id)
+WHERE released_at IS NULL;
+```
+
+The predicate matters because `checkouts` keeps history. A plain
+`UNIQUE (locker_id)` would reject every future checkout for a locker once its
+first checkout row existed. The partial index ignores released rows and
+therefore limits only rows representing active checkouts.
+
+`createUniqueConstraintCheckout()` does not read availability before writing.
+The insert itself is the attempt to claim the locker:
+
+```text
+caller A: INSERT ──→ accepted
+caller B: INSERT ──→ SQLSTATE 23505
+```
+
+When concurrent inserts target the same locker, PostgreSQL accepts one active
+row and rejects the other. The strategy recognizes a `23505` unique violation
+only when PostgreSQL names `one_active_checkout_per_locker` as the violated
+constraint. That expected conflict becomes `{ outcome: "unavailable" }`.
+Other unique violations, foreign-key failures, and infrastructure errors are
+re-thrown rather than being mislabeled as normal contention.
+
+This is an invariant enforced by the database, not an application locking
+protocol. PostgreSQL may wait internally while it determines whether a
+conflicting transaction commits, but callers do not acquire or release an
+explicit application-visible lock.
+
+### Migration scope
+
+The partial index is deliberately a strategy-specific migration. The shared
+base migrations omit it so the baseline race and the limitations of the other
+strategies remain observable.
+
+During tests, `applyUniqueConstraintMigration()` applies
+`migrations/strategies/unique-constraint.sql` only to the isolated schema used
+by this strategy. The normal `npm run migrate` command scans only SQL files at
+the top level of `migrations/`, so it does not currently install this index in
+the application's default schema. A deployment using this strategy must add
+the strategy migration to its selected migration path.
+
+### What the tests prove
+
+| Test                                                                                         | Status and evidence                                                                                                                                           |
+| -------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [Shared contract](../test/integration/strategies/unique-constraint/contract.test.ts)         | Complete. Sixteen concurrent calls produce one winner, every other caller returns `unavailable`, and PostgreSQL contains one active checkout.                 |
+| [Constraint collision](../test/integration/strategies/unique-constraint/constraint-collision.test.ts) | Pending. This will prove that concurrent active-row inserts collide with SQLSTATE `23505` and that a released historical row does not prevent another checkout. |
+| [Two-process topology](../test/integration/strategies/unique-constraint/topology.test.ts)    | Pending. The index lives in PostgreSQL, so it is expected to protect the invariant across Node.js processes, but that claim has not yet been tested explicitly. |
+
+The completed contract establishes the black-box behavior within one process
+under likely contention. The pending collision test will isolate the database
+mechanism and verify the partial predicate. The pending topology test will
+provide direct evidence for the cross-process guarantee.
+
+### Tradeoffs
+
+- **The invariant covers every writer.** Direct SQL and new application code
+  cannot bypass the rule while they write to the constrained PostgreSQL table.
+- **No read-before-write race.** One atomic insert replaces the separate
+  availability check and insert used by the naive implementation.
+- **Expected contention arrives as an error.** The application must identify
+  the intended constraint precisely and translate its violation into a domain
+  result without hiding unrelated database failures.
+- **The rule must fit a database constraint.** A partial index works well for
+  this row-local invariant, but rules spanning complex workflows or external
+  systems may still require another coordination mechanism.
+- **Schema rollout is part of the feature.** Existing duplicate active rows
+  must be resolved before creating the index, and every deployed environment
+  must apply the strategy-specific migration.
+- **PostgreSQL remains the coordination boundary.** Writers using another
+  datastore are outside this guarantee.
+
+### When to use it
+
+A database uniqueness rule is usually the strongest and simplest choice when
+the business invariant can be represented by a PostgreSQL constraint. It
+protects the data even when a new code path forgets an application-level
+locking convention.
+
+It is less suitable when the invariant cannot be expressed in one database,
+when writes must coordinate with external side effects, or when conflict
+handling requires work before the database statement is attempted. In those
+cases a lock or conditional-write protocol may still be needed, often with a
+database constraint retained as the final line of defense where possible.
