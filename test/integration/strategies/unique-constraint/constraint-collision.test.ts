@@ -3,19 +3,11 @@ import { randomUUID } from "node:crypto";
 import pg, { type Pool, type PoolClient } from "pg";
 import { it } from "vitest";
 import { createIsolatedTestDatabase } from "../../../support/database.ts";
+import { pollUntil } from "../../../support/polling.ts";
 import { promiseState } from "../../../support/trace.ts";
 import { applyUniqueConstraintMigration } from "../../../support/unique-constraint.ts";
 
 const { DatabaseError } = pg;
-const WAIT_TIMEOUT_MS = 2_000;
-const POLL_INTERVAL_MS = 10;
-
-function delay(milliseconds: number): Promise<void> {
-  return new Promise((resolve) => {
-    const timeout = setTimeout(resolve, milliseconds);
-    timeout.unref();
-  });
-}
 
 // A unique-index collision waits on the transaction that inserted the
 // conflicting value. Observing B's ungranted transaction-ID lock proves its
@@ -24,27 +16,23 @@ async function waitForPendingTransactionLock(
   pool: Pool,
   backendPid: number,
 ): Promise<void> {
-  const deadline = Date.now() + WAIT_TIMEOUT_MS;
-
-  while (Date.now() < deadline) {
-    const pending = await pool.query<{ waiting: boolean }>(
-      `
-        SELECT EXISTS (
-          SELECT 1
-          FROM pg_locks
-          WHERE pid = $1
-            AND locktype = 'transactionid'
-            AND granted = false
-        ) AS waiting
-      `,
-      [backendPid],
-    );
-    if (pending.rows[0]?.waiting === true) return;
-    await delay(POLL_INTERVAL_MS);
-  }
-
-  assert.fail(
-    `backend ${backendPid} did not wait on a transaction lock within ${WAIT_TIMEOUT_MS}ms`,
+  await pollUntil(
+    async () => {
+      const pending = await pool.query<{ waiting: boolean }>(
+        `
+          SELECT EXISTS (
+            SELECT 1
+            FROM pg_locks
+            WHERE pid = $1
+              AND locktype = 'transactionid'
+              AND granted = false
+          ) AS waiting
+        `,
+        [backendPid],
+      );
+      return pending.rows[0]?.waiting === true;
+    },
+    `backend ${backendPid} to wait on a transaction lock`,
   );
 }
 
