@@ -10,6 +10,7 @@ still pending.
 | ----------------------------------------- | ------------------------------------------------- | ----------------------------- | ---------------------- | --------------------------------------------------------------------- |
 | Keyed mutex                               | A JavaScript `Map` owned by one checkout instance | Yes, with one shared instance | No                     | A single writer process, or a local optimization above a shared guard |
 | Postgres advisory lock (`READ COMMITTED`) | PostgreSQL's advisory-lock manager                | Yes                           | Yes                    | Multiple application processes sharing one Postgres database          |
+| Redis lease with PostgreSQL fencing       | Redis lease/token counter and a PostgreSQL row    | Yes                           | Yes                    | Distributed coordination that must reject expired owners              |
 | Optimistic locking                        | A version column on the PostgreSQL locker row     | Yes                           | Yes                    | Low-contention writes where callers can retry after conflicts         |
 | Database uniqueness rule                  | A PostgreSQL partial unique index                 | Yes                           | Yes                    | Invariants that can be expressed directly in the database schema      |
 
@@ -160,6 +161,155 @@ It is less attractive when lock waits would occupy scarce pool connections,
 or when not every writer can be required to use the same convention. If an
 invariant can be expressed directly as a PostgreSQL constraint, enforcing it
 in the schema provides a stronger guard against bypassing application code.
+
+## Redis lease with PostgreSQL fencing
+
+### How it works
+
+`createRedisFencingCheckout()` combines two mechanisms with different jobs:
+
+| Mechanism                       | Purpose                                                                 |
+| ------------------------------- | ----------------------------------------------------------------------- |
+| Redis lease                     | Coordinates the owner expected to perform work now                      |
+| Random owner token              | Prevents an old owner from deleting another owner's replacement lease   |
+| Increasing fencing token        | Orders owners so PostgreSQL can reject one that resumes too late        |
+| PostgreSQL `last_fencing_token` | Remembers the newest owner accepted by the protected storage resource   |
+
+Acquisition runs one short Redis Lua script. It attempts the lease with
+`SET NX PX` and increments the resource's fencing counter only after the
+lease was acquired:
+
+```text
+SET lease-key <random UUID> NX PX <TTL>
+                 ↓ acquired
+INCR fencing-token-key
+                 ↓
+return fencing token
+```
+
+`NX` means the lease is created only when the key is absent. `PX` sets its
+expiry in milliseconds so a crashed process does not retain the lease
+forever. Redis executes the complete Lua script without interleaving another
+command, making lease acquisition and token allocation one atomic operation.
+A caller that finds an existing lease currently returns `unavailable`; this
+implementation does not wait or retry.
+
+The lease key and fencing-counter key use the same Redis Cluster hash tag:
+
+```text
+redis-fencing:{namespace:locker:42}:lease
+redis-fencing:{namespace:locker:42}:token
+```
+
+Redis Cluster hashes only `namespace:locker:42`, placing both keys in the same
+hash slot. A multi-key Lua script cannot run across different cluster nodes,
+so this key placement is part of cluster compatibility. Different lockers
+use different hash tags and can still be distributed across the cluster.
+
+### Why the lease is not enough
+
+A TTL limits how long Redis recognizes an owner, but it cannot stop code that
+was paused while holding the lease:
+
+```text
+A acquires token 1
+A pauses past its TTL
+                    B acquires token 2
+                    B reaches PostgreSQL
+A resumes
+```
+
+The random owner token makes A's later release harmless: its compare-and-delete
+Lua script sees that A no longer owns the lease and leaves B's key intact. It
+does not, however, prevent A from sending a late database write. Ownership-safe
+release and stale-write prevention are separate guarantees.
+
+Before reading availability, each owner presents its fencing token to
+PostgreSQL:
+
+```sql
+UPDATE lockers
+SET last_fencing_token = $token
+WHERE id = $locker_id
+  AND last_fencing_token < $token;
+```
+
+If a newer token has already been recorded, the update affects zero rows and
+the stale checkout returns `unavailable`. If the token is accepted, the update
+locks that locker row until the transaction completes. The strategy then reads
+availability and inserts the checkout in the same `READ COMMITTED`
+transaction:
+
+```text
+accept fencing token and lock locker row
+                    ↓
+read current availability
+                    ↓
+insert checkout if available
+                    ↓
+commit and release row lock
+```
+
+The ordering matters. A competing database writer waits for the locker row,
+then its separate availability statement receives a fresh `READ COMMITTED`
+snapshot after the preceding transaction commits.
+
+The Redis lease is released in `finally` with a second atomic Lua script. It
+deletes the key only when the stored UUID still matches the caller's owner
+token. If the lease expired or was replaced, the script deliberately does
+nothing.
+
+### What the tests currently prove
+
+| Test                                                                                       | Status and evidence                                                                                                                      |
+| ------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| [Shared contract](../test/integration/strategies/redis-fencing/contract.test.ts)           | Implemented: concurrent calls produce one winner, the other callers return `unavailable`, and PostgreSQL contains one active checkout.   |
+| [Lease ownership](../test/integration/strategies/redis-fencing/lock-ownership.test.ts)     | Pending: prove an unexpired lease excludes another owner and release requires the matching UUID.                                         |
+| [Lease expiry](../test/integration/strategies/redis-fencing/lease-expiry.test.ts)           | Pending: demonstrate both reacquisition after TTL expiry and the stale-holder weakness of a lease without fencing.                       |
+| [Fencing](../test/integration/strategies/redis-fencing/fencing.test.ts)                     | Pending: prove tokens increase and PostgreSQL rejects an older token after accepting a newer one.                                        |
+| [Two-process topology](../test/integration/strategies/redis-fencing/topology.test.ts)       | Pending: prove the Redis-and-PostgreSQL coordination boundary crosses explicit Node.js processes.                                        |
+
+The current contract establishes black-box behavior under ordinary
+contention. The pending mechanism tests are still needed before the repository
+can claim deterministic evidence for expiry safety and cross-process fencing.
+
+### Tradeoffs
+
+- **Two infrastructure systems participate.** Correctness depends on both
+  Redis lease/token operations and PostgreSQL's conditional write. This adds
+  operational and failure-handling complexity compared with a PostgreSQL-only
+  strategy.
+- **The lease does not cancel JavaScript execution.** A process can continue
+  after its TTL expires. Fencing works because the protected storage system
+  checks the token, not because the old process knows that it became stale.
+- **Every writer must honor fencing.** A direct checkout insert that does not
+  condition its work on `last_fencing_token` bypasses stale-owner protection.
+- **There is no lease renewal or contention queue.** A long operation can
+  outlive the default five-second lease, while a caller encountering an
+  existing lease immediately receives `unavailable`.
+- **The fencing counter must retain its ordering.** If Redis loses or resets
+  the counter while PostgreSQL retains `last_fencing_token`, newly generated
+  values are no longer newer. A production design must make the counter
+  durable enough for its safety assumptions, recover it safely, or generate
+  the ordering token in durable storage. This repository's intentionally
+  ephemeral Redis container is safe for isolated tests with fresh namespaces,
+  but it does not by itself provide that production durability.
+- **Hot lockers still serialize in PostgreSQL.** Fencing is not a substitute
+  for the row-level serialization needed around the availability read and
+  insert.
+
+### When to use it
+
+Redis leases with storage-enforced fencing fit distributed workers that
+already depend on Redis, need crash recovery through lease expiry, and can
+require every protected storage write to validate an ordering token. The
+pattern is especially relevant when work extends beyond one PostgreSQL lock
+or transaction and an expired process may resume later.
+
+It is unnecessary complexity when PostgreSQL alone can express the invariant
+with a constraint, conditional update, or advisory lock. A Redis lease without
+storage-side fencing is also insufficient when stale owners can cause damage:
+safe release protects the lock key, while fencing protects the resource.
 
 ## Optimistic locking
 

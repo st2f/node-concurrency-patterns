@@ -11,7 +11,6 @@ export interface CheckoutContractSubject {
 }
 
 export interface CheckoutContractContext {
-  // database prefix
   namespace: string;
 }
 
