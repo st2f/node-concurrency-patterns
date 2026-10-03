@@ -13,6 +13,8 @@
     "migrate": "node src/migrate.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "test:containers": "vitest run --config vitest.containers.config.ts",
+    "test:containers:colima": "DOCKER_HOST=unix://$HOME/.colima/default/docker.sock TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE=/var/run/docker.sock npm run test:containers",
     "test:watch": "vitest"
   },
   "dependencies": {
@@ -20,9 +22,17 @@
     "pg": "^8.13.1"
   },
   "devDependencies": {
+    "@testcontainers/postgresql": "^12.2.0",
     "@types/node": "^24.0.0",
     "@types/pg": "^8.11.10",
+    "testcontainers": "^12.2.0",
     "typescript": "^5.7.2",
     "vitest": "^4.1.5"
+  },
+  "allowScripts": {
+    "cpu-features@0.0.10": true,
+    "fsevents@2.3.3": true,
+    "protobufjs@7.6.6": true,
+    "ssh2@1.17.0": true
   }
 }
