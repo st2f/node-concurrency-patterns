@@ -1,3 +1,5 @@
+[![CI](https://github.com/st2f/node-concurrency-patterns/actions/workflows/ci.yml/badge.svg)](https://github.com/st2f/node-concurrency-patterns/actions/workflows/ci.yml)
+
 # node-concurrency-patterns
 
 A learning project exploring different ways to protect shared state when concurrent Node.js operations race to modify the same resource.
