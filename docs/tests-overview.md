@@ -58,7 +58,7 @@ DB constraint     ✓                  ✓
 
 That will make the limitation of an in-memory mutex extremely concrete. The mutex isn’t defective; its synchronization boundary is simply the Node process.
 
-A lease-only Redis lock can pass ordinary contention tests across processes while its TTL remains valid, but it fails the expired-holder scenario shown below. The checkmarks therefore apply to Redis combined with storage-layer validation, such as fencing.
+A lock-only Redis lock can pass ordinary contention tests across processes while its TTL remains valid, but it fails the expired-holder scenario shown below. The checkmarks therefore apply to Redis combined with storage-layer validation, such as fencing.
 
 ## Redis progression
 
@@ -69,7 +69,7 @@ token-safe release
    ↓
 "so distributed locking is solved?"
    ↓
-NO — lease expires while A is paused
+NO — lock expires while A is paused
    ↓
 B obtains lock
    ↓
@@ -111,7 +111,7 @@ test/
       redis-fencing/
         contract.test.ts
         lock-ownership.test.ts
-        lease-expiry.test.ts
+        lock-expiry.test.ts
         fencing.test.ts
         topology.test.ts
 
@@ -134,6 +134,6 @@ The worker and parent-side IPC barrier are shared infrastructure: build them
 for the keyed-mutex topology test, then reuse them for the remaining strategy
 directories.
 
-Redis has additional files because acquiring and safely releasing a lease,
+Redis has additional files because acquiring and safely releasing a lock,
 demonstrating expiry failure, and rejecting stale writers through fencing are
 separate claims.

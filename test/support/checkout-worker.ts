@@ -1,10 +1,12 @@
 import { fork, type ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { Redis } from "ioredis";
 import pg from "pg";
 import type { Checkout, CheckoutResult } from "../../src/checkout.ts";
 import { createAdvisoryLockCheckout } from "../../src/strategies/advisory-lock.ts";
 import { createKeyedMutexCheckout } from "../../src/strategies/keyed-mutex.ts";
 import { createOptimisticLockingCheckout } from "../../src/strategies/optimistic-locking.ts";
+import { createRedisFencingCheckout } from "../../src/strategies/redis-fencing.ts";
 import { createUniqueConstraintCheckout } from "../../src/strategies/unique-constraint.ts";
 
 const { Pool } = pg;
@@ -14,12 +16,14 @@ export type CheckoutStrategyId =
   | "keyed-mutex"
   | "advisory-lock"
   | "optimistic-locking"
-  | "unique-constraint";
+  | "unique-constraint"
+  | "redis-fencing";
 export type CheckoutWorkerOrchestration =
   | "pause-after-availability-read"
   | "pause-after-advisory-lock-acquired"
   | "pause-after-version-read"
-  | "pause-before-insert";
+  | "pause-before-insert"
+  | "pause-after-redis-lock-acquired";
 
 export interface CheckoutWorkerPostgresConfig {
   host: string;
@@ -34,6 +38,8 @@ export interface SpawnCheckoutWorkerOptions {
   strategy: CheckoutStrategyId;
   namespace: string;
   postgres: CheckoutWorkerPostgresConfig;
+  redis?: { host: string; port: number };
+  lockTtlMs?: number;
   orchestration?: CheckoutWorkerOrchestration;
 }
 
@@ -360,6 +366,8 @@ function sendFromWorker(message: WorkerMessage): void {
 
 async function runWorker(): Promise<void> {
   let pool: pg.Pool | undefined;
+  let redis: Redis | undefined;
+  let lockTtlMs: number | undefined;
   let checkout: Checkout | undefined;
   let orchestration: CheckoutWorkerOrchestration | undefined;
   let activeAttemptId: string | undefined;
@@ -393,6 +401,18 @@ async function runWorker(): Promise<void> {
     }
 
     switch (strategy) {
+      case "redis-fencing":
+        if (redis === undefined) throw new Error("Redis client is not initialized");
+        return createRedisFencingCheckout(strategyPool, redis, {
+          lockNamespace: namespace,
+          ...(lockTtlMs === undefined ? {} : { lockTtlMs }),
+          async afterLockAcquired() {
+            await pauseAtOrchestrationSeam(
+              "pause-after-redis-lock-acquired",
+              "Redis-lock seam",
+            );
+          },
+        });
       case "keyed-mutex":
         return createKeyedMutexCheckout(strategyPool, {
           async afterAvailabilityRead() {
@@ -444,6 +464,12 @@ async function runWorker(): Promise<void> {
       if (pool !== undefined) throw new Error("worker is already initialized");
       orchestration = message.orchestration;
       pool = new Pool({ ...message.postgres, max: 1 });
+      if (message.strategy === "redis-fencing") {
+        if (message.redis === undefined) throw new Error("Redis config is required");
+        redis = new Redis({ ...message.redis, maxRetriesPerRequest: 3 });
+        lockTtlMs = message.lockTtlMs;
+        await redis.ping();
+      }
       checkout = buildCheckout(message.strategy, pool, message.namespace);
       sendFromWorker({ type: "ready" });
       return;
@@ -460,7 +486,11 @@ async function runWorker(): Promise<void> {
       closing = true;
       releaseActiveSeam?.();
       await Promise.allSettled(inFlight);
-      await pool?.end();
+      try {
+        await pool?.end();
+      } finally {
+        await redis?.quit();
+      }
       sendFromWorker({ type: "closed" });
       process.disconnect();
       return;

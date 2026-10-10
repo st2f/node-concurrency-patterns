@@ -3,9 +3,9 @@ import type { Redis } from "ioredis";
 import type { Pool } from "pg";
 import type { Checkout } from "../checkout.ts";
 
-const DEFAULT_LEASE_TTL_MS = 5_000;
+const DEFAULT_LOCK_TTL_MS = 5_000;
 
-const ACQUIRE_LEASE_SCRIPT = `
+const ACQUIRE_LOCK_SCRIPT = `
   local acquired = redis.call(
     "SET",
     KEYS[1],
@@ -28,7 +28,7 @@ const ACQUIRE_LEASE_SCRIPT = `
   return fencingToken
 `;
 
-const RELEASE_LEASE_SCRIPT = `
+const RELEASE_LOCK_SCRIPT = `
   if redis.call("GET", KEYS[1]) == ARGV[1] then
     return redis.call("DEL", KEYS[1])
   end
@@ -36,12 +36,12 @@ const RELEASE_LEASE_SCRIPT = `
   return 0
 `;
 
-export interface RedisLease {
+export interface RedisLock {
   ownerToken: string;
   fencingToken: number;
 }
 
-export interface RedisLeaseOptions {
+export interface RedisLockOptions {
   lockNamespace: string;
   resourceId: number;
   ttlMs: number;
@@ -49,12 +49,12 @@ export interface RedisLeaseOptions {
 
 export interface RedisFencingCheckoutOptions {
   lockNamespace: string;
-  leaseTtlMs?: number;
-  afterLeaseAcquired?(lease: Readonly<RedisLease>): Promise<void>;
+  lockTtlMs?: number;
+  afterLockAcquired?(lock: Readonly<RedisLock>): Promise<void>;
 }
 
-interface RedisLeaseKeys {
-  leaseKey: string;
+interface RedisLockKeys {
+  lockKey: string;
   fencingTokenKey: string;
 }
 
@@ -64,9 +64,9 @@ function assertLockNamespace(lockNamespace: string): void {
   }
 }
 
-function assertLeaseTtl(ttlMs: number): void {
+function assertLockTtl(ttlMs: number): void {
   if (!Number.isSafeInteger(ttlMs) || ttlMs <= 0) {
-    throw new RangeError("leaseTtlMs must be a positive safe integer");
+    throw new RangeError("lockTtlMs must be a positive safe integer");
   }
 }
 
@@ -74,7 +74,7 @@ function resourceKeyPrefix(lockNamespace: string): string {
   return `redis-fencing:{${lockNamespace}:locker:`;
 }
 
-/** Match every lease and persistent fencing-token key in one namespace. */
+/** Match every lock and persistent fencing-token key in one namespace. */
 export function redisFencingNamespaceKeyPattern(
   lockNamespace: string,
 ): string {
@@ -82,40 +82,40 @@ export function redisFencingNamespaceKeyPattern(
   return `${resourceKeyPrefix(lockNamespace)}*}:*`;
 }
 
-function leaseKeys(
+function lockKeys(
   lockNamespace: string,
   resourceId: number,
-): RedisLeaseKeys {
+): RedisLockKeys {
   // The braces form a Redis Cluster hash tag. Both keys therefore occupy the
   // same hash slot, which allows the acquisition script to use them together.
   const resource = `${resourceKeyPrefix(lockNamespace)}${resourceId}}`;
   return {
-    leaseKey: `${resource}:lease`,
+    lockKey: `${resource}:lock`,
     fencingTokenKey: `${resource}:token`,
   };
 }
 
 /**
- * Attempt to acquire one expiring Redis lease and allocate its fencing token.
- * A null result means another owner currently holds the lease.
+ * Attempt to acquire one expiring Redis lock and allocate its fencing token.
+ * A null result means another owner currently holds the lock.
  */
-export async function acquireRedisLease(
+export async function acquireRedisLock(
   redis: Redis,
-  options: RedisLeaseOptions,
-): Promise<RedisLease | null> {
+  options: RedisLockOptions,
+): Promise<RedisLock | null> {
   assertLockNamespace(options.lockNamespace);
-  assertLeaseTtl(options.ttlMs);
+  assertLockTtl(options.ttlMs);
 
   if (!Number.isSafeInteger(options.resourceId)) {
     throw new RangeError("resourceId must be a safe integer");
   }
 
   const ownerToken = randomUUID();
-  const keys = leaseKeys(options.lockNamespace, options.resourceId);
+  const keys = lockKeys(options.lockNamespace, options.resourceId);
   const result: unknown = await redis.eval(
-    ACQUIRE_LEASE_SCRIPT,
+    ACQUIRE_LOCK_SCRIPT,
     2,
-    keys.leaseKey,
+    keys.lockKey,
     keys.fencingTokenKey,
     ownerToken,
     options.ttlMs,
@@ -136,30 +136,30 @@ export async function acquireRedisLease(
 }
 
 /**
- * Release a lease only if Redis still contains this owner's random token.
+ * Release a lock only if Redis still contains this owner's random token.
  * The comparison and deletion share one Lua script so they are atomic.
  */
-export async function releaseRedisLease(
+export async function releaseRedisLock(
   redis: Redis,
-  options: Pick<RedisLeaseOptions, "lockNamespace" | "resourceId">,
-  lease: RedisLease,
+  options: Pick<RedisLockOptions, "lockNamespace" | "resourceId">,
+  lock: RedisLock,
 ): Promise<boolean> {
   assertLockNamespace(options.lockNamespace);
   if (!Number.isSafeInteger(options.resourceId)) {
     throw new RangeError("resourceId must be a safe integer");
   }
 
-  const keys = leaseKeys(options.lockNamespace, options.resourceId);
+  const keys = lockKeys(options.lockNamespace, options.resourceId);
   const result: unknown = await redis.eval(
-    RELEASE_LEASE_SCRIPT,
+    RELEASE_LOCK_SCRIPT,
     1,
-    keys.leaseKey,
-    lease.ownerToken,
+    keys.lockKey,
+    lock.ownerToken,
   );
 
   if (result !== 0 && result !== 1) {
     throw new Error(
-      `Redis returned an invalid lease-release result: ${String(result)}`,
+      `Redis returned an invalid lock-release result: ${String(result)}`,
     );
   }
 
@@ -172,20 +172,20 @@ export function createRedisFencingCheckout(
   options: RedisFencingCheckoutOptions,
 ): Checkout {
   assertLockNamespace(options.lockNamespace);
-  const leaseTtlMs = options.leaseTtlMs ?? DEFAULT_LEASE_TTL_MS;
-  assertLeaseTtl(leaseTtlMs);
+  const lockTtlMs = options.lockTtlMs ?? DEFAULT_LOCK_TTL_MS;
+  assertLockTtl(lockTtlMs);
 
   return async (userId, lockerId) => {
-    const leaseOptions = {
+    const lockOptions = {
       lockNamespace: options.lockNamespace,
       resourceId: lockerId,
-      ttlMs: leaseTtlMs,
+      ttlMs: lockTtlMs,
     };
-    const lease = await acquireRedisLease(redis, leaseOptions);
-    if (lease === null) return { outcome: "unavailable" };
+    const lock = await acquireRedisLock(redis, lockOptions);
+    if (lock === null) return { outcome: "unavailable" };
 
     try {
-      await options.afterLeaseAcquired?.(lease);
+      await options.afterLockAcquired?.(lock);
 
       const client = await pool.connect();
       let transactionOpen = false;
@@ -203,7 +203,7 @@ export function createRedisFencingCheckout(
             SET last_fencing_token = $2
             WHERE id = $1 AND last_fencing_token < $2
           `,
-          [lockerId, lease.fencingToken],
+          [lockerId, lock.fencingToken],
         );
 
         if (accepted.rowCount === 0) {
@@ -262,9 +262,9 @@ export function createRedisFencingCheckout(
         client.release();
       }
     } finally {
-      // If the TTL elapsed or another owner replaced this lease, the Lua
-      // script returns false and deliberately leaves the newer lease intact.
-      await releaseRedisLease(redis, leaseOptions, lease);
+      // If the TTL elapsed or another owner replaced this lock, the Lua
+      // script returns false and deliberately leaves the newer lock intact.
+      await releaseRedisLock(redis, lockOptions, lock);
     }
   };
 }

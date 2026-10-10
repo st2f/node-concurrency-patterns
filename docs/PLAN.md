@@ -129,7 +129,7 @@ If two processes insert concurrently, Postgres accepts one insert and rejects th
 
 ### Redis distributed lock and fencing
 
-First, implement a Redis lease:
+First, implement a Redis lock:
 
 ```text
 SET lock:<key> <owner-token> NX PX <ttl>
@@ -141,7 +141,7 @@ The owner-token check makes release safe, but it does not make an expired owner 
 
 ```text
 A acquires the lock
-A pauses until its lease expires
+A pauses until its lock expires
 B acquires the lock and writes
 A resumes and tries to write
 ```
@@ -150,14 +150,14 @@ A must not be allowed to write after B. Checking the token during release only s
 
 The owner token above is a random identity: it answers "is this still my lock?" A fencing token is different. It is an increasing number that records the order in which owners acquired the lock.
 
-Postgres remembers the highest fencing token it has accepted and rejects a write carrying an older token. A resumed owner can therefore be recognized as stale even after its Redis lease expires.
+Postgres remembers the highest fencing token it has accepted and rejects a write carrying an older token. A resumed owner can therefore be recognized as stale even after its Redis lock expires.
 
 Fencing and optimistic locking both use conditional database writes, but their values mean different things:
 
 - An optimistic-lock version is read from the database row. The write succeeds only if that row still has the same version.
 - A fencing token represents the order in which owners acquired the lock. The database rejects an owner older than one it has already accepted.
 
-Using `UPDATE ... WHERE version = $expected` alongside Redis can still be a valid design, but it combines the Redis lease with optimistic locking. It is not, by itself, a fencing-token implementation.
+Using `UPDATE ... WHERE version = $expected` alongside Redis can still be a valid design, but it combines the Redis lock with optimistic locking. It is not, by itself, a fencing-token implementation.
 
 ## Test-harness decisions
 
